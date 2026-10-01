@@ -24,12 +24,11 @@ function updatedInput(output: string): Record<string, unknown> {
   const parsed = JSON.parse(output) as {
     hookSpecificOutput: {
       hookEventName: string;
-      permissionDecision: string;
       updatedInput: Record<string, unknown>;
     };
   };
   assert.equal(parsed.hookSpecificOutput.hookEventName, "PreToolUse");
-  assert.equal(parsed.hookSpecificOutput.permissionDecision, "allow");
+  assert.equal("permissionDecision" in parsed.hookSpecificOutput, false);
   return parsed.hookSpecificOutput.updatedInput;
 }
 
@@ -42,11 +41,42 @@ void test("оборачивает devin -p и pi -p, сохраняя descriptio
     const input = updatedInput(output);
     assert.equal(
       input["command"],
-      `node '${WATCHDOG}' --silence 600 -- bash -c '${command.replaceAll("'", String.raw`'\''`)}'`,
+      `node '${WATCHDOG}' --silence 600 --max-seconds 585 -- bash -c '${command.replaceAll("'", String.raw`'\''`)}'`,
     );
     assert.equal(input["description"], "запуск");
     assert.equal(input["timeout"], 600_000);
   }
+});
+
+void test("таймаут переднего плана → --max-seconds = таймаут − 15 с, не меньше 30", () => {
+  const cases: [number, string][] = [
+    [120_000, "105"],
+    [600_000, "585"],
+    [20_000, "30"],
+    [1500, "30"],
+  ];
+  for (const [timeout, seconds] of cases) {
+    const input = updatedInput(
+      wrapRunnerCommand(bash("devin -p x", { timeout }), WATCHDOG),
+    );
+    assert.equal(
+      input["command"],
+      `node '${WATCHDOG}' --silence 600 --max-seconds ${seconds} -- bash -c 'devin -p x'`,
+    );
+  }
+});
+
+void test("run_in_background: порог тишины как есть, без --max-seconds", () => {
+  const input = updatedInput(
+    wrapRunnerCommand(
+      bash("devin -p x", { run_in_background: true, timeout: 600_000 }),
+      WATCHDOG,
+    ),
+  );
+  assert.equal(
+    input["command"],
+    `node '${WATCHDOG}' --silence 600 -- bash -c 'devin -p x'`,
+  );
 });
 
 void test("не трогает ls, git status, devin --version, pipe -p", () => {

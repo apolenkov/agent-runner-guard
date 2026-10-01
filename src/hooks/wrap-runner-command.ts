@@ -27,14 +27,23 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
     const command = (toolInput as Record<string, unknown>)["command"];
     if (typeof command !== "string" || !RUNNER.test(command)) return "";
     if (!existsSync(watchdogPath)) return "";
+    // Передний план обрывается таймаутом Bash-инструмента раньше порога
+    // тишины: сторож должен остановить группу и записать итог до него.
+    const { timeout, run_in_background: isBackground } = toolInput as Record<
+      string,
+      unknown
+    >;
+    const limit =
+      isBackground !== true && typeof timeout === "number" && timeout > 0
+        ? ` --max-seconds ${String(Math.max(30, Math.floor(timeout / 1000 - 15)))}`
+        : "";
     const quoted = command.replaceAll("'", String.raw`'\''`);
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
         updatedInput: {
           ...toolInput,
-          command: `node '${watchdogPath.replaceAll("'", String.raw`'\''`)}' --silence 600 -- bash -c '${quoted}'`,
+          command: `node '${watchdogPath.replaceAll("'", String.raw`'\''`)}' --silence 600${limit} -- bash -c '${quoted}'`,
         },
       },
     });
