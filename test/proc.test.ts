@@ -8,17 +8,18 @@ import {
   parsePsList,
 } from "../src/proc.ts";
 
-void test("parsePsList разбирает ps -axo pid=,ppid=,etime=,stat=,command=", () => {
+void test("parsePsList разбирает ps -axo pid=,ppid=,pgid=,etime=,stat=,command=", () => {
   const output = [
-    "  123     1 02:30:15 Ss /usr/bin/foo --arg one",
-    "   45   123    2-03:04:05 S+ bar baz",
-    "    7     1       00:05 Z sleep 5",
+    "  123     1   123 02:30:15 Ss /usr/bin/foo --arg one",
+    "   45   123   123    2-03:04:05 S+ bar baz",
+    "    7     1     9       00:05 Z sleep 5",
   ].join("\n");
   const list = parsePsList(output);
   assert.deepEqual(list, [
     {
       pid: 123,
       ppid: 1,
+      pgid: 123,
       etimeSeconds: 2 * 3600 + 30 * 60 + 15,
       stat: "Ss",
       command: "/usr/bin/foo --arg one",
@@ -26,11 +27,19 @@ void test("parsePsList разбирает ps -axo pid=,ppid=,etime=,stat=,comman
     {
       pid: 45,
       ppid: 123,
+      pgid: 123,
       etimeSeconds: 2 * 86_400 + 3 * 3600 + 4 * 60 + 5,
       stat: "S+",
       command: "bar baz",
     },
-    { pid: 7, ppid: 1, etimeSeconds: 5, stat: "Z", command: "sleep 5" },
+    {
+      pid: 7,
+      ppid: 1,
+      pgid: 9,
+      etimeSeconds: 5,
+      stat: "Z",
+      command: "sleep 5",
+    },
   ]);
 });
 
@@ -40,6 +49,7 @@ void test("listProcesses: видим себя с настоящим ppid и stat
   assert.ok(self !== undefined);
   assert.match(self.stat ?? "", /^[A-Z]/);
   assert.equal(self.ppid, process.ppid);
+  assert.ok(self.pgid > 0);
 });
 
 void test("cwdOf: рабочий каталог текущего процесса", async () => {
@@ -53,11 +63,11 @@ void test("cwdOf: несуществующий pid → undefined", async () => {
 void test("descendantsOf: всё дерево потомков", () => {
   const list = parsePsList(
     [
-      "   10     1 00:01 S parent",
-      "   11    10 00:01 S child",
-      "   12    11 00:01 S grandchild",
-      "   13    10 00:01 S child2",
-      "   99     1 00:01 S other",
+      "   10     1    1 00:01 S parent",
+      "   11    10    1 00:01 S child",
+      "   12    11    1 00:01 S grandchild",
+      "   13    10    1 00:01 S child2",
+      "   99     1    1 00:01 S other",
     ].join("\n"),
   );
   assert.deepEqual(

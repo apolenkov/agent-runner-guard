@@ -7,12 +7,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 /**
- * Строка ps: pid, ppid, возраст в секундах, состояние (stat; «Z» —
+ * Строка ps: pid, ppid, pgid (группа процессов), возраст в секундах, состояние (stat; «Z» —
  * зомби) и командная строка.
  */
 export interface ProcessInfo {
   pid: number;
   ppid: number;
+  pgid: number;
   etimeSeconds: number;
   stat?: string;
   command: string;
@@ -37,40 +38,44 @@ export async function run(
 }
 
 /**
- * Все процессы системы: `ps -axo pid=,ppid=,etime=,stat=,command=`.
+ * Все процессы системы: `ps -axo pid=,ppid=,pgid=,etime=,stat=,command=`.
  */
 export async function listProcesses(): Promise<ProcessInfo[]> {
   const { stdout } = await run("ps", [
     "-axo",
-    "pid=,ppid=,etime=,stat=,command=",
+    "pid=,ppid=,pgid=,etime=,stat=,command=",
   ]);
   return parsePsList(stdout);
 }
 
 /**
- * Разбор вывода `ps -axo pid=,ppid=,etime=,stat=,command=` (etime —
+ * Разбор вывода `ps -axo pid=,ppid=,pgid=,etime=,stat=,command=` (etime —
  * [[дни-]часы:]минуты:секунды).
  * @internal Экспорт для тестов.
  */
 export function parsePsList(output: string): ProcessInfo[] {
   const result: ProcessInfo[] = [];
   for (const line of output.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*\S)\s*$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*\S)\s*$/.exec(
+      line,
+    );
     if (
       match?.[1] === undefined ||
       match[2] === undefined ||
       match[3] === undefined ||
       match[4] === undefined ||
-      match[5] === undefined
+      match[5] === undefined ||
+      match[6] === undefined
     ) {
       continue;
     }
     result.push({
       pid: Number(match[1]),
       ppid: Number(match[2]),
-      etimeSeconds: parseEtime(match[3]),
-      stat: match[4],
-      command: match[5],
+      pgid: Number(match[3]),
+      etimeSeconds: parseEtime(match[4]),
+      stat: match[5],
+      command: match[6],
     });
   }
   return result;
