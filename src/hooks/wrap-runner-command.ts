@@ -33,10 +33,13 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
       string,
       unknown
     >;
+    // Без явного timeout Bash-инструмент в переднем плане обрывает команду на 120 с.
+    const timeoutMs =
+      typeof timeout === "number" && timeout > 0 ? timeout : 120_000;
     const limit =
-      isBackground !== true && typeof timeout === "number" && timeout > 0
-        ? ` --max-seconds ${String(Math.max(30, Math.floor(timeout / 1000 - 15)))}`
-        : "";
+      isBackground === true
+        ? ""
+        : ` --max-seconds ${String(Math.max(30, Math.floor(timeoutMs / 1000 - 15)))}`;
     const quoted = command.replaceAll("'", String.raw`'\''`);
     return JSON.stringify({
       hookSpecificOutput: {

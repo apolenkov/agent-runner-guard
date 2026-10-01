@@ -98,7 +98,13 @@ void test("экранирование: одинарные кавычки, $, ;, 
   // Настоящий разбор bash: печатаем аргумент -c через подставной node.
   const result = spawnSync(
     "bash",
-    ["-c", wrapped.replace(/^node \S+ --silence 600 -- bash -c/, "printf %s")],
+    [
+      "-c",
+      wrapped.replace(
+        /^node \S+ --silence 600 --max-seconds 105 -- bash -c/,
+        "printf %s",
+      ),
+    ],
     { encoding: "utf8" },
   );
   assert.equal(result.stdout, command);
@@ -139,7 +145,7 @@ void test("как скрипт: JSON на входе → JSON на выходе,
   assert.equal(wrapped.status, 0);
   assert.equal(
     updatedInput(wrapped.stdout)["command"],
-    `node '${WATCHDOG}' --silence 600 -- bash -c 'devin -p x'`,
+    `node '${WATCHDOG}' --silence 600 --max-seconds 105 -- bash -c 'devin -p x'`,
   );
   const garbage = spawnSync(process.execPath, [HOOK], {
     input: "}{",
@@ -158,7 +164,15 @@ void test("путь к сторожу с пробелом и кавычкой э
   };
   assert.equal(
     output.hookSpecificOutput.updatedInput.command,
-    `node '${fake.replaceAll("'", String.raw`'\''`)}' --silence 600 -- bash -c 'pi -p x'`,
+    `node '${fake.replaceAll("'", String.raw`'\''`)}' --silence 600 --max-seconds 105 -- bash -c 'pi -p x'`,
   );
   await rm(directory, { recursive: true, force: true });
+});
+
+void test("передний план без timeout: потолок по умолчанию 120 с − 15 = 105 с", () => {
+  const input = updatedInput(wrapRunnerCommand(bash("devin -p x"), WATCHDOG));
+  assert.equal(
+    input["command"],
+    `node '${WATCHDOG}' --silence 600 --max-seconds 105 -- bash -c 'devin -p x'`,
+  );
 });
