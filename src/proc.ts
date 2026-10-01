@@ -45,6 +45,7 @@ export async function listProcesses(): Promise<ProcessInfo[]> {
 /**
  * Разбор вывода `ps -axo pid=,ppid=,etime=,command=` (etime —
  * [[дни-]часы:]минуты:секунды).
+ * @internal Экспорт для тестов.
  */
 export function parsePsList(output: string): ProcessInfo[] {
   const result: ProcessInfo[] = [];
