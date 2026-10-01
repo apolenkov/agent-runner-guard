@@ -27,7 +27,12 @@ const TICK_MS = 200;
 const TERM_GRACE_MS = 5000;
 const DEFAULT_SILENCE = 600;
 const DEFAULT_RESET_SECONDS = 30 * 60;
-const RATE_LIMIT_PATTERN = /rate.?limit|too many requests|\b429\b|quota/i;
+// Devin: «quota» бывает в обычном коде, поэтому ищем только его формулировку.
+const DEVIN_LIMIT_PATTERN =
+  /Reached free model rate limit|too many requests|\b429\b/i;
+const OTHER_LIMIT_PATTERN = /rate.?limit|too many requests|\b429\b|quota/i;
+// Обёртки и приставки перед настоящей командой: env, VAR=1, timeout 600, …
+const PREFIX_TOKEN = /^(?:env|nohup|nice|exec|timeout|\w+=.*|-\S*|\d+[smhd]?)$/;
 
 export interface WatchdogArguments {
   silence: number;
@@ -77,17 +82,30 @@ export function parseWatchdogArguments(argv: string[]): WatchdogArguments {
 export function detectExecutor(command: string[]): Executor | undefined {
   const [binary, ...rest] = command;
   if (binary === undefined) return undefined;
-  const direct = executorOf(command.join(" "));
+  const direct = executorInLine(command.join(" "));
   if (direct !== undefined) return direct;
   if (!/^(?:ba|z)?sh$/.test(path.basename(binary))) return undefined;
   if (!rest.includes("-c")) return undefined;
   const script = rest[rest.indexOf("-c") + 1];
   if (script === undefined) return undefined;
   for (const part of script.split(/[;&|\n]+/)) {
-    const executor = executorOf(part.trim());
+    const executor = executorInLine(part);
     if (executor !== undefined) return executor;
   }
   return undefined;
+}
+
+/*
+ * Исполнитель простой команды после обёрток (`env X=1`, `timeout 60`, …).
+ */
+function executorInLine(line: string): Executor | undefined {
+  const tokens = line
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.replace(/^\(+/, ""))
+    .filter((token) => token !== "");
+  const index = tokens.findIndex((token) => !PREFIX_TOKEN.test(token));
+  return index === -1 ? undefined : executorOf(tokens.slice(index).join(" "));
 }
 
 /**
@@ -99,7 +117,9 @@ export function findRateLimit(
   executor: Executor | undefined,
   nowMs: number,
 ): number | undefined {
-  if (!RATE_LIMIT_PATTERN.test(tail)) return undefined;
+  const pattern =
+    executor === "devin" ? DEVIN_LIMIT_PATTERN : OTHER_LIMIT_PATTERN;
+  if (!pattern.test(tail)) return undefined;
   let seconds = DEFAULT_RESET_SECONDS;
   const reset = /reset in (\d+)\s*(minute|hour)/i.exec(tail);
   if (executor === "devin" && reset?.[1] !== undefined) {

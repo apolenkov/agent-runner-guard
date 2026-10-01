@@ -302,6 +302,35 @@ void test("не лимит: «429» в выводе при коде 0 → DONE 0
   }
 });
 
+void test("devin с «quota» в обычном выводе и кодом 1 → не лимит, файл не пишется", async () => {
+  const other = await mkdtemp(path.join(tmpdir(), "watchdog-quota-"));
+  try {
+    const result = await watchdog(
+      ["--", path.join(bin, "devin"), "-p", "-c", "echo 'quota.ts'; exit 1"],
+      other,
+    );
+    assert.equal(result.code, 1);
+    assert.equal(result.lastLine, "DONE 1");
+    await assert.rejects(stat(path.join(other, ".local")));
+  } finally {
+    await rm(other, { recursive: true, force: true });
+  }
+});
+
+void test("pi с «quota» и кодом 1 → RATE_LIMIT", async () => {
+  const other = await mkdtemp(path.join(tmpdir(), "watchdog-quota-pi-"));
+  try {
+    const result = await watchdog(
+      ["--", path.join(bin, "pi"), "-c", "echo 'quota exceeded'; exit 1"],
+      other,
+    );
+    assert.equal(result.code, 75);
+    assert.match(result.lastLine, /^RATE_LIMIT \d+$/);
+  } finally {
+    await rm(other, { recursive: true, force: true });
+  }
+});
+
 void test("остановка сторожем + признак лимита в хвосте → RATE_LIMIT, а не STALLED", async () => {
   const result = await watchdog([
     "--silence",
@@ -324,6 +353,22 @@ void test("detectExecutor: прямая команда, sh -c со строко�
     "devin",
   );
   assert.equal(detectExecutor(["sh", "-c", "pi -p x"]), "pi");
+  for (const line of [
+    "env X=1 devin -p x",
+    "timeout 600 devin -p x",
+    "nohup devin -p x",
+    "cd d; VAR=1 devin -p x",
+    "nice -n 5 pi -p x",
+    "exec env A=b timeout -k 5 60 pi -p x",
+    "true && ( devin -p x ) &",
+  ]) {
+    assert.ok(
+      detectExecutor(["bash", "-c", line]) !== undefined,
+      `bash -c ${line}`,
+    );
+  }
+  assert.equal(detectExecutor(["env", "X=1", "devin", "-p", "x"]), "devin");
+  assert.equal(detectExecutor(["bash", "-c", "echo 5 devin -p"]), undefined);
   assert.equal(detectExecutor(["devin", "--version"]), undefined);
   assert.equal(detectExecutor(["sh", "-c", "ls -la"]), undefined);
   assert.equal(detectExecutor(["sleep", "1"]), undefined);
@@ -332,7 +377,11 @@ void test("detectExecutor: прямая команда, sh -c со строко�
 void test("findRateLimit: признак ищется в хвосте, reset in N minutes|hours", () => {
   const now = 1_000_000_000_000;
   assert.equal(
-    findRateLimit("rate limit. reset in 2 hours", "devin", now),
+    findRateLimit(
+      "Reached free model rate limit. reset in 2 hours",
+      "devin",
+      now,
+    ),
     1_000_000_000 + 7200,
   );
   assert.equal(
@@ -343,6 +392,10 @@ void test("findRateLimit: признак ищется в хвосте, reset in 
     findRateLimit("reset in 3 minutes, quota", "pi", now),
     1_000_000_000 + 1800,
   );
+  assert.equal(findRateLimit("quota exceeded", "devin", now), undefined);
+  assert.equal(findRateLimit("generic rate limit", "devin", now), undefined);
+  assert.ok(findRateLimit("quota exceeded", "pi", now) !== undefined);
+  assert.ok(findRateLimit("quota exceeded", undefined, now) !== undefined);
   assert.equal(findRateLimit("всё хорошо", "devin", now), undefined);
   assert.equal(findRateLimit("порт 4290 занят", "devin", now), undefined);
 });
