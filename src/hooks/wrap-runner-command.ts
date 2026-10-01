@@ -34,7 +34,7 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
         permissionDecision: "allow",
         updatedInput: {
           ...toolInput,
-          command: `node ${watchdogPath} --silence 600 -- bash -c '${quoted}'`,
+          command: `node '${watchdogPath.replaceAll("'", String.raw`'\''`)}' --silence 600 -- bash -c '${quoted}'`,
         },
       },
     });
