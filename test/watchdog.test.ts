@@ -45,11 +45,11 @@ interface Result {
 /**
  * Запуск сторожа как отдельного процесса с HOME во временном каталоге.
  */
-function watchdog(arguments_: string[]): Promise<Result> {
+function watchdog(arguments_: string[], homeDirectory = home): Promise<Result> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const child = spawn(process.execPath, [WATCHDOG, ...arguments_], {
-      env: { ...process.env, HOME: home },
+      env: { ...process.env, HOME: homeDirectory },
     });
     let stdout = "";
     let stderr = "";
@@ -74,6 +74,22 @@ async function aliveCommands(marker: string): Promise<string[]> {
   return list
     .filter((p) => p.command.includes(marker) && !p.stat?.startsWith("Z"))
     .map((p) => p.command);
+}
+
+/*
+ * Страховка: убить СВОИ синтетические процессы с маркером в команде.
+ */
+async function killMarked(marker: string): Promise<void> {
+  const list = await listProcesses();
+  for (const p of list) {
+    if (p.command.includes(marker) && p.pid !== process.pid) {
+      try {
+        process.kill(p.pid, "SIGKILL");
+      } catch {
+        // уже нет
+      }
+    }
+  }
 }
 
 void test("DONE: команда завершилась сама — код команды, вывод проброшен", async () => {
@@ -117,6 +133,61 @@ void test("STALLED silence: тишина → 76, процесс и потомо�
     assert.equal(neighbours.length, 1);
   } finally {
     neighbour.kill();
+  }
+});
+
+void test("фоновый потомок в группе умершего bash: сторож ждёт его, затем DONE 0", async () => {
+  const result = await watchdog([
+    "--",
+    "bash",
+    "-c",
+    "sleep 3.7 > /dev/null 2>&1 &",
+  ]);
+  assert.equal(result.lastLine, "DONE 0");
+  assert.equal(result.code, 0);
+  assert.ok(result.seconds >= 3.5, `заняло ${String(result.seconds)} с`);
+  assert.deepEqual(await aliveCommands("sleep 3.7"), []);
+});
+
+void test("фоновый молчащий потомок после выхода bash → STALLED silence, группа убита", async () => {
+  const result = await watchdog([
+    "--silence",
+    "2",
+    "--",
+    "bash",
+    "-c",
+    "sleep 123.45 > /dev/null 2>&1 &",
+  ]);
+  try {
+    assert.equal(result.code, 76);
+    assert.equal(result.lastLine, "STALLED silence");
+    assert.deepEqual(await aliveCommands("sleep 123.45"), []);
+  } finally {
+    await killMarked("sleep 123.45");
+  }
+});
+
+void test("потребитель закрыл канал (EPIPE) → группа убита, сирот нет", async () => {
+  const child = spawn(
+    process.execPath,
+    [
+      WATCHDOG,
+      "--",
+      "sh",
+      "-c",
+      "echo a; sleep 0.5; echo b; sleep 0.5; echo c; exec sleep 77.7 >/dev/null 2>&1",
+    ],
+    { env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  child.stdout.once("data", () => child.stdout.destroy());
+  const closed = new Promise<void>((resolve) => child.on("close", resolve));
+  const timer = setTimeout(() => child.kill(), 20_000);
+  try {
+    await closed;
+    assert.deepEqual(await aliveCommands("sleep 77.7"), []);
+  } finally {
+    clearTimeout(timer);
+    await killMarked("sleep 77.7");
   }
 });
 
@@ -213,31 +284,16 @@ void test("RATE_LIMIT pi: без «reset in» → epoch ≈ now+1800, файл p
 void test("не лимит: «429» в выводе при коде 0 → DONE 0, файл не пишется", async () => {
   const other = await mkdtemp(path.join(tmpdir(), "watchdog-nolimit-"));
   try {
-    const result = await new Promise<Result>((resolve) => {
-      const child = spawn(
-        process.execPath,
-        [
-          WATCHDOG,
-          "--",
-          path.join(bin, "devin"),
-          "-p",
-          "-c",
-          "echo 'status 429 quota'; exit 0",
-        ],
-        { env: { ...process.env, HOME: other } },
-      );
-      let stdout = "";
-      child.stdout.on("data", (c: Buffer) => (stdout += c.toString()));
-      child.on("close", (code) => {
-        resolve({
-          stdout,
-          stderr: "",
-          code,
-          lastLine: stdout.trimEnd().split("\n").at(-1) ?? "",
-          seconds: 0,
-        });
-      });
-    });
+    const result = await watchdog(
+      [
+        "--",
+        path.join(bin, "devin"),
+        "-p",
+        "-c",
+        "echo 'status 429 quota'; exit 0",
+      ],
+      other,
+    );
     assert.equal(result.code, 0);
     assert.equal(result.lastLine, "DONE 0");
     await assert.rejects(stat(path.join(other, ".local")));

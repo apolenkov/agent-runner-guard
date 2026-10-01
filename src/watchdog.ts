@@ -12,7 +12,7 @@ import { mkdir, chmod, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants, homedir } from "node:os";
 import path from "node:path";
 
-import { descendantsOf, listProcesses } from "./proc.ts";
+import { listProcesses } from "./proc.ts";
 import {
   cpuTimeSum,
   executorOf,
@@ -23,6 +23,7 @@ import type { Executor } from "./source.ts";
 
 const TAIL_BYTES = 64 * 1024;
 const POLL_MS = 2000;
+const TICK_MS = 200;
 const TERM_GRACE_MS = 5000;
 const DEFAULT_SILENCE = 600;
 const DEFAULT_RESET_SECONDS = 30 * 60;
@@ -129,11 +130,8 @@ export async function writeLimitFile(
   }
 }
 
-function sleep(ms: number, isUnref = false): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    if (isUnref) timer.unref(); // не держит процесс после завершения команды
-  });
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isGroupAlive(pgid: number): boolean {
@@ -157,6 +155,7 @@ async function stopGroup(pgid: number): Promise<void> {
   }
   const deadline = Date.now() + TERM_GRACE_MS;
   while (isGroupAlive(pgid) && Date.now() < deadline) await sleep(100);
+  if (!isGroupAlive(pgid)) return;
   try {
     process.kill(-pgid, "SIGKILL");
   } catch {
@@ -172,12 +171,13 @@ interface Sample {
 }
 
 async function sampleSignals(
-  root: number,
+  pgid: number,
   watchFile: string | undefined,
 ): Promise<Sample> {
+  // Вся группа процессов, включая фоновые `&`, пережившие своего родителя.
   const list = await listProcesses();
-  const kids = descendantsOf(list, root);
-  const cpu = await cpuTimeSum([root, ...kids.map((kid) => kid.pid)]);
+  const kids = list.filter((p) => p.pgid === pgid);
+  const cpu = await cpuTimeSum(kids.map((kid) => kid.pid));
   const children = kids
     .map((kid) => kid.pid)
     .toSorted((a, b) => a - b)
@@ -210,12 +210,8 @@ async function sampleSignals(
 
 /**
  * Запуск и надзор; возвращает код выхода сторожа.
- * @internal Экспорт для отладки; интерфейс — командная строка.
  */
-export async function runWatchdog(
-  arguments_: WatchdogArguments,
-  intervalMs = POLL_MS,
-): Promise<number> {
+async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   const [binary, ...rest] = arguments_.command;
   if (binary === undefined) return 2;
   const executor = detectExecutor(arguments_.command);
@@ -229,7 +225,8 @@ export async function runWatchdog(
     stop?: "silence" | "ceiling";
     isFinished: boolean;
     isNewlineEnded: boolean;
-  } = { isFinished: false, isNewlineEnded: true };
+    isAbandoned: boolean;
+  } = { isFinished: false, isNewlineEnded: true, isAbandoned: false };
   const isDone = (): boolean => state.isFinished;
   let lastSignal = started;
   let tail = Buffer.alloc(0);
@@ -243,6 +240,13 @@ export async function runWatchdog(
     };
   child.stdout.on("data", forward(process.stdout, true));
   child.stderr.on("data", forward(process.stderr, false));
+  // Потребитель закрыл канал (`| head`): пишем уже некуда — гасим группу.
+  const abandon = (): void => {
+    state.isAbandoned = true;
+  };
+  process.stdout.on("error", abandon);
+  process.stderr.on("error", abandon);
+  const startParent = process.ppid;
 
   const exit = new Promise<{ code: number; spawnError?: string }>((resolve) => {
     child.on("error", (error) => {
@@ -264,8 +268,10 @@ export async function runWatchdog(
       }
     }
   };
-  process.on("SIGTERM", forwardSignal("SIGTERM"));
-  process.on("SIGINT", forwardSignal("SIGINT"));
+  const onTerm = forwardSignal("SIGTERM");
+  const onInterrupt = forwardSignal("SIGINT");
+  process.on("SIGTERM", onTerm);
+  process.on("SIGINT", onInterrupt);
 
   let previous: Sample | undefined;
   try {
@@ -273,27 +279,38 @@ export async function runWatchdog(
   } catch {
     // сбой ps — первая проба будет опорной
   }
+  let lastSample = Date.now();
   let stopText = "";
   void exit.then(() => {
     state.isFinished = true;
   });
-  while (!isDone()) {
-    await Promise.race([exit, sleep(intervalMs, true)]);
-    if (pgid === undefined || isDone()) break;
-    try {
-      const sample = await sampleSignals(pgid, arguments_.watchFile);
-      if (
-        previous !== undefined &&
-        (sample.cpu > previous.cpu ||
-          sample.children !== previous.children ||
-          sample.log > previous.log ||
-          sample.file > previous.file)
-      ) {
-        lastSignal = Date.now();
+  // Надзор идёт, пока жива вся группа: фоновые `&` переживают свою оболочку.
+  while (pgid !== undefined && (!isDone() || isGroupAlive(pgid))) {
+    await sleep(TICK_MS);
+    if (state.isAbandoned || (startParent !== 1 && process.ppid === 1)) {
+      await stopGroup(pgid);
+      process.off("SIGTERM", onTerm);
+      process.off("SIGINT", onInterrupt);
+      await exit;
+      return 141;
+    }
+    if (Date.now() - lastSample >= POLL_MS) {
+      lastSample = Date.now();
+      try {
+        const sample = await sampleSignals(pgid, arguments_.watchFile);
+        if (
+          previous !== undefined &&
+          (sample.cpu > previous.cpu ||
+            sample.children !== previous.children ||
+            sample.log > previous.log ||
+            sample.file > previous.file)
+        ) {
+          lastSignal = Date.now();
+        }
+        previous = sample;
+      } catch {
+        // сбой ps — не сигнал и не повод останавливать
       }
-      previous = sample;
-    } catch {
-      // сбой ps — не сигнал и не повод останавливать
     }
     const now = Date.now();
     if (
@@ -314,6 +331,8 @@ export async function runWatchdog(
       break;
     }
   }
+  process.off("SIGTERM", onTerm);
+  process.off("SIGINT", onInterrupt);
   const result = await exit;
   if (result.spawnError !== undefined) {
     process.stderr.write(
