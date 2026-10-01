@@ -3,20 +3,25 @@
  *
  * Закрывает:
  * - ключи вида `sk-…` и `sk-ant-…` (длинный хвост после префикса);
- * - токен после слова `Bearer`;
- * - значения в `ИМЯ=значение`, если имя содержит
- *   TOKEN|SECRET|KEY|PASSWORD|PASS|CREDENTIAL (имя оставляем, значение — `***`);
+ * - токен после слов `Bearer` и `Basic` (регистр любой, слово сохраняется);
+ * - значения в `ИМЯ=значение`, если имя в любом регистре содержит
+ *   token|secret|key|password|pass|credential (имя оставляем, значение —
+ *   `***`); имя, лишь содержащее ключевое слово внутри (`keyboard`,
+ *   `monkeyPatch`), тоже маскируется — сознательно консервативно;
  * - пути к `credentials.toml` (весь путь — `<credentials>`).
  */
 export function mask(text: string): string {
   return text
     .replaceAll(
-      /\b[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD|PASS|CREDENTIAL)[A-Z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)/g,
+      /\b[\w-]*(?:token|secret|key|password|pass|credential)[\w-]*=(?:"[^"]*"|'[^']*'|\S*)/gi,
       (m) => `${m.slice(0, m.indexOf("="))}=***`,
     )
     .replaceAll(/\bsk-(ant-)?[\w-]{4,}/g, (m, ant: string | undefined) =>
       ant === undefined ? "sk-***" : "sk-ant-***",
     )
-    .replaceAll(/\bBearer[ \t]+\S+/g, "Bearer ***")
+    .replaceAll(
+      /\b(Bearer|Basic)[ \t]+\S+/gi,
+      (m, scheme: string) => `${scheme} ***`,
+    )
     .replaceAll(/\S*credentials\.toml\b/g, "<credentials>");
 }

@@ -32,9 +32,36 @@ void test("маскирует значение для имён с TOKEN|SECRET|K
   assert.equal(mask('API_TOKEN="sek ret"'), "API_TOKEN=***");
 });
 
-void test("не трогает key=value с безобидным именем", () => {
-  assert.equal(mask("color=red mode=fast"), "color=red mode=fast");
-  assert.equal(mask("key=value"), "key=value");
+void test("маскирует имена секретов в любом регистре", () => {
+  assert.equal(mask("api_key=sekret123"), "api_key=***");
+  assert.equal(mask("Token=abc.def"), "Token=***");
+  assert.equal(mask("mySecret=zzz"), "mySecret=***");
+  assert.equal(mask("dbPassword=hunter2"), "dbPassword=***");
+  assert.equal(mask("SSH_PASS=x"), "SSH_PASS=***");
+  assert.equal(mask("key=value"), "key=***");
+  assert.equal(mask("x-api-key=top"), "x-api-key=***");
+});
+
+void test("консервативно маскирует «key» внутри слова", () => {
+  // Решение зафиксировано: имя, лишь СОДЕРЖАЩЕЕ token|key|… внутри слова,
+  // тоже маскируется — лишнее маскирование безопаснее утечки.
+  assert.equal(mask("keyboard=us"), "keyboard=***");
+  assert.equal(mask("monkeyPatch=1"), "monkeyPatch=***");
+});
+
+void test("не трогает имена без «=» и безобидные key=value", () => {
+  assert.equal(
+    mask("call monkeyPatch(el) и color=red mode=fast"),
+    "call monkeyPatch(el) и color=red mode=fast",
+  );
+});
+
+void test("маскирует Authorization: Basic …", () => {
+  assert.equal(
+    mask("Authorization: Basic dXNlcjpwYXNz"),
+    "Authorization: Basic ***",
+  );
+  assert.equal(mask("basic abc123"), "basic ***");
 });
 
 void test("маскирует пути к credentials.toml", () => {
