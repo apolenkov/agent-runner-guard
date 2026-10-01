@@ -71,3 +71,34 @@ void test("маскирует пути к credentials.toml", () => {
   );
   assert.equal(mask("/a/b/credentials.toml открыт"), "<credentials> открыт");
 });
+
+void test("маскирует значения с пробелами вокруг «=» (TOML)", () => {
+  assert.equal(mask('api_key = "abc def"'), "api_key = ***");
+  assert.equal(mask("token = 'zzz'"), "token = ***");
+  assert.equal(
+    mask("DB_PASSWORD  =  hunter2 дальше"),
+    "DB_PASSWORD  =  *** дальше",
+  );
+});
+
+void test("маскирует пары «имя: значение» в кавычках", () => {
+  assert.equal(mask('{"api_key": "abc123"}'), '{"api_key": ***}');
+  assert.equal(mask("secret: 'abc'"), "secret: ***");
+});
+
+void test("маскирует Authorization: token …", () => {
+  assert.equal(mask("Authorization: token abc123"), "Authorization: token ***");
+  assert.equal(mask("authorization: Bearer abc"), "authorization: Bearer ***");
+});
+
+void test("маскирует токены с известными префиксами", () => {
+  assert.equal(mask(`a ghp_${"A1b2".repeat(9)} b`), "a gh*** b");
+  assert.equal(mask(`gho_${"x".repeat(30)}`), "gh***");
+  assert.equal(mask("xoxb-123456789012-abcdefABCDEF"), "xox***");
+  assert.equal(mask("id AKIAABCDEFGHIJKLMNOP конец"), "id AKIA*** конец");
+});
+
+void test("обычный текст со знаками «=» и «:» не трогает", () => {
+  const text = "a = b; цвет: красный; token limit reached; AKIA short ghp_x";
+  assert.equal(mask(text), text);
+});
