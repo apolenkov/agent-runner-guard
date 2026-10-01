@@ -266,7 +266,6 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   };
   process.stdout.on("error", abandon);
   process.stderr.on("error", abandon);
-  const startParent = process.ppid;
 
   const exit = new Promise<{ code: number; spawnError?: string }>((resolve) => {
     child.on("error", (error) => {
@@ -307,7 +306,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   // Надзор идёт, пока жива вся группа: фоновые `&` переживают свою оболочку.
   while (pgid !== undefined && (!isDone() || isGroupAlive(pgid))) {
     await sleep(TICK_MS);
-    if (state.isAbandoned || (startParent !== 1 && process.ppid === 1)) {
+    if (state.isAbandoned) {
       await stopGroup(pgid);
       process.off("SIGTERM", onTerm);
       process.off("SIGINT", onInterrupt);
@@ -353,6 +352,12 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   }
   process.off("SIGTERM", onTerm);
   process.off("SIGINT", onInterrupt);
+  if (state.stop !== undefined) {
+    // потомок вне группы (setsid) может держать канал вывода: не ждём его вечно
+    await Promise.race([exit, sleep(1000)]);
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
   const result = await exit;
   if (result.spawnError !== undefined) {
     process.stderr.write(

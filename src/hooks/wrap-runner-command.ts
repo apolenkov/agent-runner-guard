@@ -34,12 +34,11 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
       unknown
     >;
     // Без явного timeout Bash-инструмент в переднем плане обрывает команду на 120 с.
+    // Фон обрывается таймаутом Bash так же (по умолчанию 30 минут).
+    const fallbackMs = isBackground === true ? 1_800_000 : 120_000;
     const timeoutMs =
-      typeof timeout === "number" && timeout > 0 ? timeout : 120_000;
-    const limit =
-      isBackground === true
-        ? ""
-        : ` --max-seconds ${String(Math.max(30, Math.floor(timeoutMs / 1000 - 15)))}`;
+      typeof timeout === "number" && timeout > 0 ? timeout : fallbackMs;
+    const limit = ` --max-seconds ${String(Math.max(30, Math.floor(timeoutMs / 1000 - 15)))}`;
     const quoted = command.replaceAll("'", String.raw`'\''`);
     return JSON.stringify({
       hookSpecificOutput: {

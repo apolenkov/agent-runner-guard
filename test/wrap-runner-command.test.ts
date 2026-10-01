@@ -66,16 +66,26 @@ void test("таймаут переднего плана → --max-seconds = та
   }
 });
 
-void test("run_in_background: порог тишины как есть, без --max-seconds", () => {
-  const input = updatedInput(
+void test("run_in_background: потолок тоже по таймауту Bash (явный или 30 минут)", () => {
+  const explicit = updatedInput(
     wrapRunnerCommand(
       bash("devin -p x", { run_in_background: true, timeout: 600_000 }),
       WATCHDOG,
     ),
   );
   assert.equal(
-    input["command"],
-    `node '${WATCHDOG}' --silence 600 -- bash -c 'devin -p x'`,
+    explicit["command"],
+    `node '${WATCHDOG}' --silence 600 --max-seconds 585 -- bash -c 'devin -p x'`,
+  );
+  const byDefault = updatedInput(
+    wrapRunnerCommand(
+      bash("devin -p x", { run_in_background: true }),
+      WATCHDOG,
+    ),
+  );
+  assert.equal(
+    byDefault["command"],
+    `node '${WATCHDOG}' --silence 600 --max-seconds 1785 -- bash -c 'devin -p x'`,
   );
 });
 

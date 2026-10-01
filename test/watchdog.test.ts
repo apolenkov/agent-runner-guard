@@ -431,3 +431,23 @@ void test("writeLimitFile: атомарно, перезаписывает, вр�
   const info = await stat(path.join(directory, "devin"));
   assert.equal(info.mode & 0o777, 0o600);
 });
+
+void test("родитель сторожа вышел раньше задачи: задача не убивается, итог DONE 0", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "wd-parent-"));
+  const out = path.join(directory, "out.txt");
+  // оболочка запускает сторож в фоне и сразу выходит (как `nohup … &`)
+  const shell = spawn(
+    "sh",
+    [
+      "-c",
+      `node '${WATCHDOG}' --silence 30 -- sh -c 'sleep 2; echo работа' > '${out}' 2>&1 & sleep 1; exit 0`,
+    ],
+    { stdio: "ignore" },
+  );
+  await new Promise((resolve) => shell.on("close", resolve));
+  await new Promise((resolve) => setTimeout(resolve, 3500));
+  const text = await readFile(out, "utf8");
+  assert.match(text, /работа/);
+  assert.match(text, /DONE 0\s*$/);
+  await rm(directory, { recursive: true, force: true });
+});
