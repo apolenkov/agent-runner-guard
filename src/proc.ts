@@ -7,12 +7,14 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 /**
- * Строка ps: pid, ppid, возраст в секундах и командная строка.
+ * Строка ps: pid, ppid, возраст в секундах, состояние (stat; «Z» —
+ * зомби) и командная строка.
  */
 export interface ProcessInfo {
   pid: number;
   ppid: number;
   etimeSeconds: number;
+  stat?: string;
   command: string;
 }
 
@@ -35,27 +37,31 @@ export async function run(
 }
 
 /**
- * Все процессы системы: `ps -axo pid=,ppid=,etime=,command=`.
+ * Все процессы системы: `ps -axo pid=,ppid=,etime=,stat=,command=`.
  */
 export async function listProcesses(): Promise<ProcessInfo[]> {
-  const { stdout } = await run("ps", ["-axo", "pid=,ppid=,etime=,command="]);
+  const { stdout } = await run("ps", [
+    "-axo",
+    "pid=,ppid=,etime=,stat=,command=",
+  ]);
   return parsePsList(stdout);
 }
 
 /**
- * Разбор вывода `ps -axo pid=,ppid=,etime=,command=` (etime —
+ * Разбор вывода `ps -axo pid=,ppid=,etime=,stat=,command=` (etime —
  * [[дни-]часы:]минуты:секунды).
  * @internal Экспорт для тестов.
  */
 export function parsePsList(output: string): ProcessInfo[] {
   const result: ProcessInfo[] = [];
   for (const line of output.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*\S)\s*$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*\S)\s*$/.exec(line);
     if (
       match?.[1] === undefined ||
       match[2] === undefined ||
       match[3] === undefined ||
-      match[4] === undefined
+      match[4] === undefined ||
+      match[5] === undefined
     ) {
       continue;
     }
@@ -63,7 +69,8 @@ export function parsePsList(output: string): ProcessInfo[] {
       pid: Number(match[1]),
       ppid: Number(match[2]),
       etimeSeconds: parseEtime(match[3]),
-      command: match[4],
+      stat: match[4],
+      command: match[5],
     });
   }
   return result;
