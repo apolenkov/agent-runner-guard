@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { test } from "node:test";
 import {
   checkNames,
-  descendants,
   descendantsOf,
   listProcesses,
   cwdOf,
@@ -64,17 +62,6 @@ void test("descendantsOf: всё дерево потомков", () => {
     [11, 13, 12],
   );
   assert.deepEqual(descendantsOf(list, 99), []);
-});
-
-void test("descendants: живой потомок виден", async () => {
-  const child = spawn("sleep", ["5"]);
-  try {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    const all = await descendants(process.pid);
-    assert.ok(all.some((p) => p.pid === child.pid));
-  } finally {
-    child.kill();
-  }
 });
 
 void test("checkNames: узнаёт проверки по имени в команде", () => {

@@ -103,13 +103,6 @@ export async function cwdOf(pid: number): Promise<string | undefined> {
 }
 
 /**
- * Потомки процесса (дети, внуки, …) по живому списку ps.
- */
-export async function descendants(pid: number): Promise<ProcessInfo[]> {
-  return descendantsOf(await listProcesses(), pid);
-}
-
-/**
  * Потомки pid внутри готового списка процессов (порядок — по уровням).
  */
 export function descendantsOf(list: ProcessInfo[], pid: number): ProcessInfo[] {
