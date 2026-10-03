@@ -3,18 +3,21 @@
  * [--max-seconds <сек>] [--watch-file <путь>] -- <команда> [аргументы…]`.
  * Запускает команду в своей группе процессов, пробрасывает вывод, раз в
  * 2 с ищет признаки жизни; при тишине или превышении потолка останавливает
- * ТОЛЬКО свою группу. Та же команда при живом первом запуске не стартует:
- * замок <executor-limits>/locks/<sha256 команды> с pid и файлом вывода.
+ * ТОЛЬКО свою группу. Та же задача при живом первом запуске не стартует:
+ * замок <executor-limits>/locks/<sha256 идентичности> — исполнитель +
+ * prompt-файл, иначе исполнитель + команда без редиректов; внутри — pgid
+ * группы, pid сторожа и файл вывода; замок жив, пока жива группа или сторож.
  * Последняя строка stdout: DONE <код> | RATE_LIMIT <epoch> |
  * STALLED <silence|ceiling> | BUSY <pid> <файл вывода>.
  * Коды выхода: код команды (75, 76 и 77 → 1), 75 — лимит, 76 — зависание,
- * 77 — та же команда уже идёт.
+ * 77 — та же задача уже идёт.
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
   mkdir,
+  open,
   readFile,
   rename,
   rm,
@@ -43,8 +46,15 @@ const DEFAULT_RESET_SECONDS = 30 * 60;
 // Devin: «quota» бывает в обычном коде, поэтому ищем только его формулировку.
 const DEVIN_LIMIT_PATTERN =
   /Reached free model rate limit|too many requests|\b429\b/i;
-const OTHER_LIMIT_PATTERN =
-  /rate.?limit|usage.?limit|too many requests|\b429\b|quota/i;
+// Codex — свои фразы целиком: usage.?limit ловит идентификаторы в коде.
+const CODEX_LIMIT_PATTERN =
+  /you've hit your usage limit|usage limit (?:reached|exceeded)|RateLimitReached|usage_limit_reached|\busage_limited\b|too many requests|\b429\b/i;
+const OTHER_LIMIT_PATTERN = /rate.?limit|too many requests|\b429\b|quota/i;
+const LIMIT_PATTERN: Record<Executor, RegExp> = {
+  codex: CODEX_LIMIT_PATTERN,
+  devin: DEVIN_LIMIT_PATTERN,
+  pi: OTHER_LIMIT_PATTERN,
+};
 const BUSY_CODE = 77;
 // Обёртки и приставки перед настоящей командой: env, VAR=1, timeout 600, …
 const PREFIX_TOKEN = /^(?:env|nohup|nice|exec|timeout|\w+=.*|-\S*|\d+[smhd]?)$/;
@@ -133,7 +143,7 @@ export function findRateLimit(
   nowMs: number,
 ): number | undefined {
   const pattern =
-    executor === "devin" ? DEVIN_LIMIT_PATTERN : OTHER_LIMIT_PATTERN;
+    executor === undefined ? OTHER_LIMIT_PATTERN : LIMIT_PATTERN[executor];
   if (!pattern.test(tail)) return undefined;
   // ponytail: сброс по умолчанию; брать время из сообщения Codex, если появится
   let seconds = DEFAULT_RESET_SECONDS;
@@ -192,31 +202,95 @@ function limitsDirectory(): string {
 }
 
 /**
- * Файл замка команды в каталоге замков: sha256 точной строки команды.
- * @internal Экспорт для тестов.
+ * Путь из --prompt-file в строке команды (с кавычками и формой =путь);
+ * нет флага — undefined.
  */
-export function runLockFile(command: string[], directory: string): string {
-  const key = createHash("sha256").update(command.join(" ")).digest("hex");
-  return path.join(directory, key);
+function promptFileOf(line: string): string | undefined {
+  const file = /--prompt-file[=\s]("[^"]*"|'[^']*'|\S+)/.exec(line)?.[1];
+  return file?.replace(/^(['"])([\s\S]*)\1$/, "$2");
 }
 
 /**
- * Замок: «pid\nфайл вывода\n»; нет файла или битый pid — undefined
- * (протухший замок перезаписывается).
+ * Каталог первого «cd <dir> &&» в строке — туда резолвятся относительные
+ * пути команды; нет — undefined.
  */
-async function readLock(
-  file: string,
-): Promise<{ pid: number; output: string } | undefined> {
+function cdDirectoryOf(line: string): string | undefined {
+  const directory = /\bcd\s+("[^"]*"|'[^']*'|[^\s;&|]+)\s*&&/.exec(line)?.[1];
+  return directory?.replace(/^(['"])([\s\S]*)\1$/, "$2");
+}
+
+// Редиректы вывода: `> f`, `>>f`, `2>f`, `2>&1`, `&> f`, `>&2`.
+const REDIRECT = /(?:\d+|&)?>>?[ \t]*(?:"[^"]*"|'[^']*'|&\d+|[^\s;|>&"']+)/g;
+
+/**
+ * Идентичность запуска для замка: исполнитель + абсолютный путь
+ * --prompt-file, иначе исполнитель + строка команды без редиректов
+ * вывода (cd остаётся) со схлопнутыми пробелами. Повтор одной задачи
+ * под другим `> файл` — тот же ключ.
+ */
+function lockIdentity(
+  command: string[],
+  executor: Executor | undefined,
+): string {
+  const line = command.join(" ");
+  const promptFile = promptFileOf(line);
+  if (promptFile !== undefined) {
+    const base = cdDirectoryOf(line) ?? process.cwd();
+    return `${executor ?? "-"}|file:${path.resolve(base, promptFile)}`;
+  }
+  const normalised = line
+    .replaceAll(REDIRECT, " ")
+    .replaceAll(/\s+/g, " ")
+    .trim();
+  return `${executor ?? "-"}|cmd:${normalised}`;
+}
+
+/**
+ * Файл замка команды в каталоге замков: sha256 идентичности запуска.
+ * @internal Экспорт для тестов.
+ */
+export function runLockFile(
+  command: string[],
+  directory: string,
+  executor?: Executor,
+): string {
+  const key = createHash("sha256")
+    .update(lockIdentity(command, executor))
+    .digest("hex");
+  return path.join(directory, key);
+}
+
+interface LockContent {
+  pgid: number | undefined;
+  pid: number | undefined;
+  output: string;
+}
+
+/**
+ * Положительное целое из строки замка, иначе undefined.
+ */
+function lockNumber(value: string | undefined): number | undefined {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * Замок: «pgid\npid сторожа\nфайл вывода\n» (pgid 0 — до перезаписи после
+ * spawn). Нет файла — undefined; пустой/битый — содержимое без pid.
+ */
+async function readLock(file: string): Promise<LockContent | undefined> {
   let text: string;
   try {
     text = await readFile(file, "utf8");
   } catch {
     return undefined;
   }
-  const [pidText, ...rest] = text.split("\n");
-  const pid = Number(pidText);
-  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-  return { pid, output: rest.join("\n").trim() || "-" };
+  const [pgidText, pidText, ...rest] = text.split("\n");
+  return {
+    pgid: lockNumber(pgidText),
+    pid: lockNumber(pidText),
+    output: rest.join("\n").trim() || "-",
+  };
 }
 
 /**
@@ -235,22 +309,86 @@ export function outputFileOf(command: string[]): string | undefined {
 }
 
 /**
- * Запись замка как у writeLimitFile: каталог 0700, файл 0600 через
- * временный файл и rename.
+ * Жив ли держатель замка: жива его группа (EPERM — есть, прав нет — жив)
+ * или жив сам сторож.
+ */
+function isLockAlive(held: LockContent): boolean {
+  return (
+    (held.pgid !== undefined && isGroupPresent(held.pgid)) ||
+    (held.pid !== undefined && isPidAlive(held.pid))
+  );
+}
+
+/**
+ * Держатель живого замка — для BUSY. Замок пустой или протухший —
+ * undefined; между чтениями пауза: файл мог быть только что создан
+ * конкурентом и ещё пуст.
+ */
+async function busyHolder(file: string): Promise<LockContent | undefined> {
+  for (let check = 0; check < 2; check += 1) {
+    const held = await readLock(file);
+    if (held !== undefined && isLockAlive(held)) return held;
+    if (check === 0) await sleep(100);
+  }
+  return undefined;
+}
+
+/**
+ * Взятие замка до spawn: O_EXCL — кто создал, тот держит. Внутри сначала
+ * только pid сторожа (pgid появится после запуска). Живой чужой замок —
+ * его содержимое для BUSY; протухший — сносится, попытка повторяется
+ * один раз. undefined — замок наш.
+ */
+async function acquireLock(
+  file: string,
+  output: string,
+): Promise<LockContent | undefined> {
+  const directory = path.dirname(file);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await chmod(directory, 0o700);
+      const handle = await open(file, "wx", 0o600);
+      try {
+        await handle.writeFile(`0\n${String(process.pid)}\n${output}\n`);
+      } finally {
+        await handle.close();
+      }
+      return undefined;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        attempt -= 1; // каталог снесло снятием чужого замка — не гонка
+        continue;
+      }
+      if (code !== "EEXIST") throw error;
+      const held = await busyHolder(file);
+      if (held !== undefined) return held;
+      await rm(file, { force: true }); // протухший — сносим и повторяем
+    }
+  }
+  // дважды проиграли взятие — команда занята
+  return (
+    (await readLock(file)) ?? { pgid: undefined, pid: undefined, output: "-" }
+  );
+}
+
+/**
+ * Перезапись замка после spawn с pgid группы — через временный файл
+ * рядом и rename (каталог уже создан acquireLock).
  */
 async function writeLock(
   file: string,
-  pid: number,
+  pgid: number,
   output: string,
 ): Promise<void> {
-  const directory = path.dirname(file);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
   const temporary = `${file}.tmp-${String(process.pid)}`;
   try {
-    await writeFile(temporary, `${String(pid)}\n${output}\n`, {
-      mode: 0o600,
-    });
+    await writeFile(
+      temporary,
+      `${String(pgid)}\n${String(process.pid)}\n${output}\n`,
+      { mode: 0o600 },
+    );
     await rename(temporary, file);
   } catch (error) {
     await rm(temporary, { force: true });
@@ -259,41 +397,63 @@ async function writeLock(
 }
 
 /**
- * Снятие замка: только если файл всё ещё наш (pid совпадает) — чужой
- * замок не трогаем.
+ * Снятие замка: только если файл всё ещё наш (pid сторожа совпадает) —
+ * чужой замок не трогаем. Каталоги подчищаются только внутри базы:
+ * сначала locks, затем сама база, если опустела — выше не поднимаемся.
  */
-async function releaseLock(
-  file: string,
-  pid: number | undefined,
-): Promise<void> {
-  if (pid === undefined) return;
+async function releaseLock(file: string): Promise<void> {
   const held = await readLock(file);
-  if (held?.pid !== pid) return;
+  if (held?.pid !== process.pid) return;
   await rm(file, { force: true });
-  // подчистить опустевшие каталоги вплоть до ~/.local — успешный запуск
-  // не оставляет следов; непустой каталог останавливает подъём
-  let directory = path.dirname(file);
-  for (let depth = 0; depth < 4; depth += 1) {
+  for (const directory of [
+    path.dirname(file),
+    path.dirname(path.dirname(file)),
+  ]) {
     try {
-      await rmdir(directory);
+      await rmdir(directory); // только пустой: чужие файлы не трогаем
     } catch {
-      break;
+      break; // непустой — стоп
     }
-    directory = path.dirname(directory);
   }
+}
+
+/**
+ * Замок снимаем только за мёртвой группой: пережила остановку — замок
+ * остаётся и протухнет по её смерти.
+ */
+async function releaseIfGone(
+  file: string,
+  pgid: number | undefined,
+): Promise<void> {
+  if (pgid !== undefined && isGroupPresent(pgid)) return;
+  await releaseLock(file);
 }
 
 function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0); // сигнал 0 — проверка существования, ничего не шлёт
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // EPERM — процесс есть, прав на сигнал нет → жив
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Группа существует для замка: хоть один член, включая зомби/чужой
+ * (EPERM). Для надзора — isGroupAlive: зомби не признак жизни.
+ */
+function isGroupPresent(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function isGroupAlive(pgid: number): boolean {
@@ -378,17 +538,22 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   if (binary === undefined) return 2;
   const executor = detectExecutor(arguments_.command);
   const started = Date.now();
-  // Замок на точную строку команды: координатор перезапускал ту же команду
-  // после STALLED при живом первом процессе — второй не стартует.
-  // ponytail: взятие неатомарно (чтение → spawn → запись); старт двух
-  // одинаковых команд строго одновременно проскочит — нужен O_EXCL, редкость
+  // Замок на идентичность задачи (исполнитель + prompt-файл/команда):
+  // координатор перезапускал ту же задачу после STALLED при живом первом
+  // процессе или с другим «> файл» — второй не стартует. Взятие O_EXCL
+  // до spawn — одновременный старт двух одинаковых исключается.
   const lockFile = runLockFile(
     arguments_.command,
     path.join(limitsDirectory(), "locks"),
+    executor,
   );
-  const held = await readLock(lockFile);
-  if (held !== undefined && isPidAlive(held.pid)) {
-    process.stdout.write(`BUSY ${String(held.pid)} ${held.output}\n`);
+  const output =
+    arguments_.watchFile ?? outputFileOf(arguments_.command) ?? "-";
+  const held = await acquireLock(lockFile, output);
+  if (held !== undefined) {
+    process.stdout.write(
+      `BUSY ${String(held.pgid ?? held.pid ?? "-")} ${held.output}\n`,
+    );
     return BUSY_CODE;
   }
   const child = spawn(binary, rest, {
@@ -398,11 +563,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   const pgid = child.pid;
   if (pgid !== undefined) {
     try {
-      await writeLock(
-        lockFile,
-        pgid,
-        arguments_.watchFile ?? outputFileOf(arguments_.command) ?? "-",
-      );
+      await writeLock(lockFile, pgid, output);
     } catch (error) {
       process.stderr.write(`WATCHDOG: замок не записан: ${String(error)}\n`);
     }
@@ -477,7 +638,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       process.off("SIGTERM", onTerm);
       process.off("SIGINT", onInterrupt);
       await exit;
-      await releaseLock(lockFile, pgid);
+      await releaseIfGone(lockFile, pgid);
       return 141;
     }
     if (Date.now() - lastSample >= POLL_MS) {
@@ -556,17 +717,17 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
         }
       }
       process.stdout.write(`RATE_LIMIT ${String(epoch)}\n`);
-      await releaseLock(lockFile, pgid);
+      await releaseIfGone(lockFile, pgid);
       return 75;
     }
   }
   if (state.stop !== undefined) {
     process.stdout.write(`STALLED ${state.stop}\n`);
-    await releaseLock(lockFile, pgid);
+    await releaseIfGone(lockFile, pgid);
     return 76;
   }
   process.stdout.write(`DONE ${String(result.code)}\n`);
-  await releaseLock(lockFile, pgid);
+  await releaseLock(lockFile);
   return [75, 76, BUSY_CODE].includes(result.code) ? 1 : result.code;
 }
 
