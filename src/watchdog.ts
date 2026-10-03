@@ -425,7 +425,12 @@ async function releaseIfGone(
   file: string,
   pgid: number | undefined,
 ): Promise<void> {
-  if (pgid !== undefined && isGroupPresent(pgid)) return;
+  // Только что вышедшая группа исчезает не мгновенно (ожидание reap):
+  // даём ей до секунды, иначе под нагрузкой замок оставался зря.
+  for (let poll = 0; pgid !== undefined && isGroupPresent(pgid); poll += 1) {
+    if (poll >= 10) return;
+    await sleep(100);
+  }
   await releaseLock(file);
 }
 
