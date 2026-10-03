@@ -17,6 +17,7 @@ function bash(command: string, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
     tool_name: "Bash",
     tool_input: { command, ...extra },
+    cwd: "/work/repo",
   });
 }
 
@@ -34,7 +35,7 @@ function updatedInput(output: string): Record<string, unknown> {
 
 void test("оборачивает devin -p и pi -p, сохраняя description и timeout", () => {
   for (const [command, watch] of [
-    ["devin -p 'задача' > out.txt", " --watch-file 'out.txt'"],
+    ["devin -p 'задача' > out.txt", " --watch-file '/work/repo/out.txt'"],
     ["cd /x && pi -p hi", ""],
   ] as const) {
     const output = wrapRunnerCommand(
@@ -94,7 +95,7 @@ void test("run_in_background: потолок тоже по таймауту Bash
 
 void test("оборачивает codex exec и codex exec review", () => {
   for (const [command, watch] of [
-    ["codex exec 'задача' > out.txt", " --watch-file 'out.txt'"],
+    ["codex exec 'задача' > out.txt", " --watch-file '/work/repo/out.txt'"],
     ["cd /x && codex exec review 'план'", ""],
   ] as const) {
     const input = updatedInput(wrapRunnerCommand(bash(command), WATCHDOG));
@@ -226,4 +227,34 @@ void test("вывод исполнителя в файл → сторож сле
     wrapRunnerCommand(bash("devin -p x 2>&1"), WATCHDOG),
   );
   assert.doesNotMatch(String(none["command"]), /--watch-file/);
+});
+
+void test("относительный файл вывода разрешается от cd в команде или от cwd хука", () => {
+  const afterCd = updatedInput(
+    wrapRunnerCommand(
+      bash("cd /w/tree && devin -p x > run.out 2>&1"),
+      WATCHDOG,
+    ),
+  );
+  assert.match(
+    String(afterCd["command"]),
+    /--watch-file '\/w\/tree\/run\.out' /,
+  );
+  const relativeCd = updatedInput(
+    wrapRunnerCommand(bash("cd sub && pi -p x > o.log"), WATCHDOG),
+  );
+  assert.match(
+    String(relativeCd["command"]),
+    /--watch-file '\/work\/repo\/sub\/o\.log' /,
+  );
+  const noCwd = updatedInput(
+    wrapRunnerCommand(
+      JSON.stringify({
+        tool_name: "Bash",
+        tool_input: { command: "devin -p x > r.out" },
+      }),
+      WATCHDOG,
+    ),
+  );
+  assert.doesNotMatch(String(noCwd["command"]), /--watch-file/); // некуда разрешить — не следим
 });

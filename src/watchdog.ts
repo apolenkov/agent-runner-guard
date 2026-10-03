@@ -29,6 +29,7 @@ import { constants, homedir } from "node:os";
 import path from "node:path";
 
 import { listProcesses } from "./proc.ts";
+import { readTail } from "./tail.ts";
 import {
   cpuTimeSum,
   executorOf,
@@ -157,11 +158,10 @@ export function findRateLimit(
 /**
 Последние TAIL_BYTES файла как текст; нет файла или пути — пустая строка.
 */
-async function readTail(file: string | undefined): Promise<string> {
+async function readFileTail(file: string | undefined): Promise<string> {
   if (file === undefined) return "";
   try {
-    const content = await readFile(file);
-    return content.subarray(-TAIL_BYTES).toString("utf8");
+    return (await readTail(file, TAIL_BYTES)) ?? "";
   } catch {
     return "";
   }
@@ -701,7 +701,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
 
   // вывод исполнителя мог уйти в файл (`> run.out; echo exit=$? >> run.out`):
   // тогда хвост и настоящий код выхода берутся из него
-  const fileTail = await readTail(arguments_.watchFile);
+  const fileTail = await readFileTail(arguments_.watchFile);
   const fileCode = /(?:^|\n)exit=(\d+)\s*$/.exec(fileTail)?.[1];
   const hasFailed =
     result.code !== 0 || (fileCode !== undefined && fileCode !== "0");

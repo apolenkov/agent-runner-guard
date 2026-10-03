@@ -7,6 +7,7 @@
  * вывод и код 0 (команда идёт как есть).
  */
 import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const RUNNER = /(?<![\w-])(?:(?:devin|pi)\s+-p|codex\s+exec)(?!\w)/;
@@ -16,7 +17,10 @@ const RUNNER = /(?<![\w-])(?:(?:devin|pi)\s+-p|codex\s+exec)(?!\w)/;
  * в файл стандартная выдача (`> f`, `>> f`, `1> f`, в кавычках или без)
  * после `devin -p`/`pi -p`. Нет — undefined (вывод и так виден сторожу).
  */
-export function outputFileOf(command: string): string | undefined {
+export function outputFileOf(
+  command: string,
+  cwd?: string,
+): string | undefined {
   const start = RUNNER.exec(command)?.index ?? 0;
   const redirect =
     /(?:^|[\s;])1?>>?\s*(?:'([^']+)'|"([^"]+)"|([^\s;&|<>]+))/.exec(
@@ -24,7 +28,21 @@ export function outputFileOf(command: string): string | undefined {
     );
   const target = redirect?.[1] ?? redirect?.[2] ?? redirect?.[3];
   if (target === undefined || target.startsWith("&")) return undefined;
-  return target === "/dev/null" ? undefined : target;
+  if (target === "/dev/null") return undefined;
+  if (path.isAbsolute(target)) return target;
+  // сторож работает в каталоге инструмента, а `cd` внутри команды — в дочерней оболочке:
+  // относительный путь разрешаем от последнего `cd` перед исполнителем (или от cwd хука)
+  const changes = command
+    .slice(0, start)
+    .matchAll(/(?:^|[\s;&|(])cd\s+(?:'([^']+)'|"([^"]+)"|([^\s;&|<>]+))/g)
+    .toArray();
+  const last = changes.at(-1);
+  const directory = last?.[1] ?? last?.[2] ?? last?.[3];
+  if (directory !== undefined && path.isAbsolute(directory)) {
+    return path.join(directory, target);
+  }
+  if (cwd === undefined || !path.isAbsolute(cwd)) return undefined;
+  return path.join(cwd, directory ?? "", target);
 }
 
 /**
@@ -35,10 +53,11 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
   try {
     const event: unknown = JSON.parse(input);
     if (typeof event !== "object" || event === null) return "";
-    const { tool_name: toolName, tool_input: toolInput } = event as Record<
-      string,
-      unknown
-    >;
+    const {
+      tool_name: toolName,
+      tool_input: toolInput,
+      cwd,
+    } = event as Record<string, unknown>;
     if (toolName !== "Bash") return "";
     if (typeof toolInput !== "object" || toolInput === null) return "";
     const command = (toolInput as Record<string, unknown>)["command"];
@@ -58,7 +77,10 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
     const limit = ` --max-seconds ${String(Math.max(30, Math.floor(timeoutMs / 1000 - 15)))}`;
     const quoted = command.replaceAll("'", String.raw`'\''`);
     // вывод уходит в файл — сторож смотрит в него: рост — жизнь, хвост — лимит
-    const outputFile = outputFileOf(command);
+    const outputFile = outputFileOf(
+      command,
+      typeof cwd === "string" ? cwd : undefined,
+    );
     const watch =
       outputFile === undefined
         ? ""
