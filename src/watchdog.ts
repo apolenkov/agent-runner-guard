@@ -5,7 +5,7 @@
  * 2 с ищет признаки жизни; при тишине или превышении потолка останавливает
  * ТОЛЬКО свою группу. Та же задача при живом первом запуске не стартует:
  * замок <executor-limits>/locks/<sha256 идентичности> — исполнитель +
- * prompt-файл, иначе исполнитель + команда без редиректов; внутри — pgid
+ * prompt-файл, иначе исполнитель + реальный cwd + команда без редиректов; внутри — pgid
  * группы, pid сторожа и файл вывода; замок жив, пока жива группа или сторож.
  * Последняя строка stdout: DONE <код> | RATE_LIMIT <epoch> |
  * STALLED <silence|ceiling> | BUSY <pid> <файл вывода>.
@@ -13,12 +13,14 @@
  * 77 — та же задача уже идёт.
  */
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import {
   chmod,
   mkdir,
   open,
   readFile,
+  readdir,
   rename,
   rm,
   rmdir,
@@ -220,12 +222,51 @@ function cdDirectoryOf(line: string): string | undefined {
 }
 
 // Редиректы вывода: `> f`, `>>f`, `2>f`, `2>&1`, `&> f`, `>&2`.
-const REDIRECT = /(?:\d+|&)?>>?[ \t]*(?:"[^"]*"|'[^']*'|&\d+|[^\s;|>&"']+)/g;
+const REDIRECT = /^(?:\d+|&)?>>?[ \t]*(?:"[^"]*"|'[^']*'|&\d+|[^\s;|>&"']+)/;
+
+/**
+ * Сохраняем кавычки и экранирование посимвольно; редиректы и лишние
+ * пробелы убираем только снаружи аргументов оболочки.
+ */
+function normalizeShell(line: string): string {
+  let result = "";
+  let quote: string | undefined;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === undefined) break;
+    if (char === "\\" && quote !== "'") {
+      result += char + (line[index + 1] ?? "");
+      index += 1;
+    } else if (quote !== undefined) {
+      result += char;
+      if (char === quote) quote = undefined;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      result += char;
+    } else {
+      const isBoundary = index === 0 || /[\s;&|]/.test(line[index - 1] ?? "");
+      const redirect =
+        isBoundary || char === ">" || char === "&"
+          ? REDIRECT.exec(line.slice(index))
+          : null;
+      if (redirect !== null) {
+        if (!result.endsWith(" ")) result += " ";
+        index += redirect[0].length - 1;
+      } else if (/\s/.test(char)) {
+        if (!result.endsWith(" ")) result += " ";
+      } else {
+        result += char;
+      }
+    }
+  }
+  return result.trim();
+}
 
 /**
  * Идентичность запуска для замка: исполнитель + абсолютный путь
  * --prompt-file, иначе исполнитель + строка команды без редиректов
- * вывода (cd остаётся) со схлопнутыми пробелами. Повтор одной задачи
+ * вывода оболочки (cd остаётся) и реальный рабочий каталог. Кавычки и
+ * границы argv сохраняются. Повтор одной задачи
  * под другим `> файл` — тот же ключ.
  */
 function lockIdentity(
@@ -238,11 +279,22 @@ function lockIdentity(
     const base = cdDirectoryOf(line) ?? process.cwd();
     return `${executor ?? "-"}|file:${path.resolve(base, promptFile)}`;
   }
-  const normalised = line
-    .replaceAll(REDIRECT, " ")
-    .replaceAll(/\s+/g, " ")
-    .trim();
-  return `${executor ?? "-"}|cmd:${normalised}`;
+  // В прямом argv символ > — обычный текст. Оболочкой разбирается
+  // только аргумент после -c; остальные границы аргументов сохраняются.
+  const isShell = /^(?:ba|z)?sh$/.test(path.basename(command[0] ?? ""));
+  const scriptIndex = isShell
+    ? command.findIndex(
+        (argument, index) => index > 0 && /^-[^-]*c/.test(argument),
+      ) + 1
+    : 0;
+  const normalised = JSON.stringify(
+    command.map((argument, index) =>
+      index === scriptIndex && scriptIndex > 0
+        ? normalizeShell(argument)
+        : argument,
+    ),
+  );
+  return `${executor ?? "-"}|cwd:${realpathSync(process.cwd())}|cmd:${normalised}`;
 }
 
 /**
@@ -334,26 +386,89 @@ async function busyHolder(file: string): Promise<LockContent | undefined> {
 }
 
 /**
+ * Guard публикуется непустым: rename не заменит каталог живого владельца.
+ * Удаляем только уникальную запись известного владельца, затем пустой
+ * каталог. Поздний уборщик не сможет снять уже заменённый guard.
+ */
+async function removeReclaimOwner(guard: string, owner: string): Promise<void> {
+  await rm(path.join(guard, owner), { force: true });
+  try {
+    await rmdir(guard);
+  } catch (error) {
+    if (
+      !["ENOENT", "ENOTEMPTY", "EEXIST"].includes(
+        (error as NodeJS.ErrnoException).code ?? "",
+      )
+    )
+      throw error;
+  }
+}
+
+async function claimReclamation(
+  file: string,
+): Promise<(() => Promise<void>) | undefined> {
+  const guard = `${file}.tmp-reclaim`;
+  const owner = `${String(process.pid)}-${randomUUID()}`;
+  const temporary = `${guard}-${owner}`;
+  await mkdir(temporary, { mode: 0o700 });
+  try {
+    await writeFile(path.join(temporary, owner), "", { mode: 0o600 });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await rename(temporary, guard);
+        return () => removeReclaimOwner(guard, owner);
+      } catch (error) {
+        if (
+          !["ENOTEMPTY", "EEXIST"].includes(
+            (error as NodeJS.ErrnoException).code ?? "",
+          )
+        )
+          throw error;
+      }
+      let owners: string[];
+      try {
+        owners = await readdir(guard);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        continue;
+      }
+      const previous = owners[0];
+      if (previous === undefined || owners.length !== 1) continue;
+      const pid = lockNumber(/^(\d+)-/.exec(previous)?.[1]);
+      if (pid === undefined || isPidAlive(pid)) return undefined;
+      await removeReclaimOwner(guard, previous);
+    }
+    return undefined;
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+}
+
+/**
  * Взятие замка до spawn: O_EXCL — кто создал, тот держит. Внутри сначала
  * только pid сторожа (pgid появится после запуска). Живой чужой замок —
  * его содержимое для BUSY; протухший — сносится, попытка повторяется
  * один раз. undefined — замок наш.
  */
-async function acquireLock(
+export async function acquireLock(
   file: string,
   output: string,
+  inspect = busyHolder,
 ): Promise<LockContent | undefined> {
   const directory = path.dirname(file);
+  const create = async (): Promise<void> => {
+    const handle = await open(file, "wx", 0o600);
+    try {
+      await handle.writeFile(`0\n${String(process.pid)}\n${output}\n`);
+    } finally {
+      await handle.close();
+    }
+  };
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await mkdir(directory, { recursive: true, mode: 0o700 });
       await chmod(directory, 0o700);
-      const handle = await open(file, "wx", 0o600);
-      try {
-        await handle.writeFile(`0\n${String(process.pid)}\n${output}\n`);
-      } finally {
-        await handle.close();
-      }
+      await create();
       return undefined;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -362,9 +477,47 @@ async function acquireLock(
         continue;
       }
       if (code !== "EEXIST") throw error;
-      const held = await busyHolder(file);
+      const held = await inspect(file);
       if (held !== undefined) return held;
-      await rm(file, { force: true }); // протухший — сносим и повторяем
+      // Только один уборщик может перечитать и снять протухший замок.
+      // Новый владелец, появившийся после первого inspect, сохраняется.
+      let releaseReclamation: (() => Promise<void>) | undefined;
+      try {
+        releaseReclamation = await claimReclamation(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        attempt -= 1;
+        continue;
+      }
+      if (releaseReclamation === undefined) {
+        return (
+          (await readLock(file)) ?? {
+            pgid: undefined,
+            pid: undefined,
+            output: "-",
+          }
+        );
+      }
+      try {
+        const current = await busyHolder(file);
+        if (current !== undefined) return current;
+        await rm(file, { force: true });
+        try {
+          await create();
+          return undefined;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          return (
+            (await busyHolder(file)) ?? {
+              pgid: undefined,
+              pid: undefined,
+              output: "-",
+            }
+          );
+        }
+      } finally {
+        await releaseReclamation();
+      }
     }
   }
   // дважды проиграли взятие — команда занята
@@ -566,13 +719,6 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     stdio: ["inherit", "pipe", "pipe"],
   });
   const pgid = child.pid;
-  if (pgid !== undefined) {
-    try {
-      await writeLock(lockFile, pgid, output);
-    } catch (error) {
-      process.stderr.write(`WATCHDOG: замок не записан: ${String(error)}\n`);
-    }
-  }
   const state: {
     stop?: "silence" | "ceiling";
     isFinished: boolean;
@@ -623,6 +769,14 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   const onInterrupt = forwardSignal("SIGINT");
   process.on("SIGTERM", onTerm);
   process.on("SIGINT", onInterrupt);
+
+  if (pgid !== undefined) {
+    try {
+      await writeLock(lockFile, pgid, output);
+    } catch (error) {
+      process.stderr.write(`WATCHDOG: замок не записан: ${String(error)}\n`);
+    }
+  }
 
   let previous: Sample | undefined;
   try {
