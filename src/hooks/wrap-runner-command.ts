@@ -38,6 +38,8 @@ export function outputFileOf(
     .toArray();
   const last = changes.at(-1);
   const directory = last?.[1] ?? last?.[2] ?? last?.[3];
+  // `cd $VAR`, `cd ~` и подобное без оболочки не разрешить — лучше не следить, чем следить не туда
+  if (directory !== undefined && /^[$~]/.test(directory)) return undefined;
   if (directory !== undefined && path.isAbsolute(directory)) {
     return path.join(directory, target);
   }

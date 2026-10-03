@@ -123,8 +123,8 @@ async function killRecorded(
     try {
       process.kill(name === "group.pid" ? -pid : pid, "SIGKILL");
     } catch (error) {
-      // ESRCH — уже нет; EPERM — на macOS так отвечает группа из одних зомби
-      // (или pid уже чужой): в обоих случаях наших живых процессов там нет
+      // ESRCH — уже нет; EPERM — на macOS так отвечает группа из одних зомби:
+      // живых процессов теста там нет
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ESRCH" && code !== "EPERM") throw error;
     }
@@ -561,28 +561,6 @@ void test("BUSY: каталог исчез при проверке владел�
       },
     );
     assert.equal(held, undefined);
-    assert.match(await readFile(file, "utf8"), /recovered.out/);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-void test("BUSY: смерть уборщика не оставляет вечный замок", async () => {
-  const directory = await mkdtemp(
-    path.join(tmpdir(), "watchdog-dead-reclaim-"),
-  );
-  const file = path.join(directory, "lock");
-  const dead = spawn("true", []);
-  await new Promise((resolve) => dead.once("exit", resolve));
-  assert.ok(dead.pid !== undefined);
-  await writeFile(file, "0\n0\nstale\n");
-  await mkdir(`${file}.tmp-reclaim`);
-  await writeFile(
-    path.join(`${file}.tmp-reclaim`, `${String(dead.pid)}-dead-owner`),
-    "",
-  );
-  try {
-    assert.equal(await acquireLock(file, "recovered.out"), undefined);
     assert.match(await readFile(file, "utf8"), /recovered.out/);
   } finally {
     await rm(directory, { recursive: true, force: true });

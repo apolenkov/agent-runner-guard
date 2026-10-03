@@ -257,4 +257,8 @@ void test("относительный файл вывода разрешаетс
     ),
   );
   assert.doesNotMatch(String(noCwd["command"]), /--watch-file/); // некуда разрешить — не следим
+  const viaVariable = updatedInput(
+    wrapRunnerCommand(bash("cd $WORK && devin -p x > r.out"), WATCHDOG),
+  );
+  assert.doesNotMatch(String(viaVariable["command"]), /--watch-file/);
 });

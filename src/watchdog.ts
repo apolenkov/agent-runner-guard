@@ -20,7 +20,7 @@ import {
   mkdir,
   open,
   readFile,
-  readdir,
+  link,
   rename,
   rm,
   rmdir,
@@ -158,7 +158,8 @@ export function findRateLimit(
 }
 
 /**
-Последние TAIL_BYTES файла как текст; нет файла или пути — пустая строка.
+Последние TAIL_BYTES файла как текст (неполная первая строка отброшена —
+для `exit=N` и признака лимита это безвредно); нет файла или пути — пустая строка.
 */
 async function readFileTail(file: string | undefined): Promise<string> {
   if (file === undefined) return "";
@@ -386,61 +387,33 @@ async function busyHolder(file: string): Promise<LockContent | undefined> {
 }
 
 /**
- * Guard публикуется непустым: rename не заменит каталог живого владельца.
- * Удаляем только уникальную запись известного владельца, затем пустой
- * каталог. Поздний уборщик не сможет снять уже заменённый guard.
+ * Снятие протухшего замка: атомарный rename в уникальное имя — удаётся ровно
+ * одному уборщику. Если за это время на месте замка оказался свежий замок
+ * нового владельца (его увели вместо протухшего), он возвращается на место
+ * через link (без перезаписи), а его владелец отдаётся для BUSY.
+ * undefined — протухший замок убран, можно брать.
  */
-async function removeReclaimOwner(guard: string, owner: string): Promise<void> {
-  await rm(path.join(guard, owner), { force: true });
+async function reclaimStale(file: string): Promise<LockContent | undefined> {
+  const moved = `${file}.stale-${String(process.pid)}-${randomUUID()}`;
   try {
-    await rmdir(guard);
+    await rename(file, moved);
   } catch (error) {
-    if (
-      !["ENOENT", "ENOTEMPTY", "EEXIST"].includes(
-        (error as NodeJS.ErrnoException).code ?? "",
-      )
-    )
-      throw error;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
-}
-
-async function claimReclamation(
-  file: string,
-): Promise<(() => Promise<void>) | undefined> {
-  const guard = `${file}.tmp-reclaim`;
-  const owner = `${String(process.pid)}-${randomUUID()}`;
-  const temporary = `${guard}-${owner}`;
-  await mkdir(temporary, { mode: 0o700 });
   try {
-    await writeFile(path.join(temporary, owner), "", { mode: 0o600 });
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    const held = await readLock(moved);
+    if (held !== undefined && isLockAlive(held)) {
       try {
-        await rename(temporary, guard);
-        return () => removeReclaimOwner(guard, owner);
+        await link(moved, file);
       } catch (error) {
-        if (
-          !["ENOTEMPTY", "EEXIST"].includes(
-            (error as NodeJS.ErrnoException).code ?? "",
-          )
-        )
-          throw error;
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
-      let owners: string[];
-      try {
-        owners = await readdir(guard);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        continue;
-      }
-      const previous = owners[0];
-      if (previous === undefined || owners.length !== 1) continue;
-      const pid = lockNumber(/^(\d+)-/.exec(previous)?.[1]);
-      if (pid === undefined || isPidAlive(pid)) return undefined;
-      await removeReclaimOwner(guard, previous);
+      return held;
     }
     return undefined;
   } finally {
-    await rm(temporary, { recursive: true, force: true });
+    await rm(moved, { force: true });
   }
 }
 
@@ -479,45 +452,9 @@ export async function acquireLock(
       if (code !== "EEXIST") throw error;
       const held = await inspect(file);
       if (held !== undefined) return held;
-      // Только один уборщик может перечитать и снять протухший замок.
-      // Новый владелец, появившийся после первого inspect, сохраняется.
-      let releaseReclamation: (() => Promise<void>) | undefined;
-      try {
-        releaseReclamation = await claimReclamation(file);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        attempt -= 1;
-        continue;
-      }
-      if (releaseReclamation === undefined) {
-        return (
-          (await readLock(file)) ?? {
-            pgid: undefined,
-            pid: undefined,
-            output: "-",
-          }
-        );
-      }
-      try {
-        const current = await busyHolder(file);
-        if (current !== undefined) return current;
-        await rm(file, { force: true });
-        try {
-          await create();
-          return undefined;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          return (
-            (await busyHolder(file)) ?? {
-              pgid: undefined,
-              pid: undefined,
-              output: "-",
-            }
-          );
-        }
-      } finally {
-        await releaseReclamation();
-      }
+      // протухший замок снимает ровно один уборщик (rename); чужой свежий не трогаем
+      const fresh = await reclaimStale(file);
+      if (fresh !== undefined) return fresh;
     }
   }
   // дважды проиграли взятие — команда занята
