@@ -1,6 +1,7 @@
 /**
- * Хук Claude Code PreToolUse (Bash): команды `devin -p` и `pi -p`
- * оборачиваются в сторож запусков (`src/watchdog.ts`) через `updatedInput`.
+ * Хук Claude Code PreToolUse (Bash): команды `devin -p`, `pi -p` и
+ * `codex exec` оборачиваются в сторож запусков (`src/watchdog.ts`) через
+ * `updatedInput`.
  * JSON со стандартного ввода → JSON со стандартного вывода. Хук никогда не
  * блокирует: любой сбой, чужая команда или отсутствие сторожа → пустой
  * вывод и код 0 (команда идёт как есть).
@@ -8,7 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const RUNNER = /(?<![\w-])(?:devin|pi)\s+-p(?!\w)/;
+const RUNNER = /(?<![\w-])(?:(?:devin|pi)\s+-p|codex\s+exec)(?!\w)/;
 
 /**
  * Куда команда отправляет вывод исполнителя: первая перенаправленная

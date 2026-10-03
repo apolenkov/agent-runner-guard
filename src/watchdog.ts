@@ -1,19 +1,24 @@
 /**
- * Сторож запусков Devin и Pi: `node src/watchdog.ts [--silence <сек>]
+ * Сторож запусков Devin, Pi и Codex: `node src/watchdog.ts [--silence <сек>]
  * [--max-seconds <сек>] [--watch-file <путь>] -- <команда> [аргументы…]`.
  * Запускает команду в своей группе процессов, пробрасывает вывод, раз в
  * 2 с ищет признаки жизни; при тишине или превышении потолка останавливает
- * ТОЛЬКО свою группу. Последняя строка stdout: DONE <код> |
- * RATE_LIMIT <epoch> | STALLED <silence|ceiling>.
- * Коды выхода: код команды (75 и 76 → 1), 75 — лимит, 76 — зависание.
+ * ТОЛЬКО свою группу. Та же команда при живом первом запуске не стартует:
+ * замок <executor-limits>/locks/<sha256 команды> с pid и файлом вывода.
+ * Последняя строка stdout: DONE <код> | RATE_LIMIT <epoch> |
+ * STALLED <silence|ceiling> | BUSY <pid> <файл вывода>.
+ * Коды выхода: код команды (75, 76 и 77 → 1), 75 — лимит, 76 — зависание,
+ * 77 — та же команда уже идёт.
  */
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod,
   mkdir,
   readFile,
   rename,
   rm,
+  rmdir,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -38,7 +43,9 @@ const DEFAULT_RESET_SECONDS = 30 * 60;
 // Devin: «quota» бывает в обычном коде, поэтому ищем только его формулировку.
 const DEVIN_LIMIT_PATTERN =
   /Reached free model rate limit|too many requests|\b429\b/i;
-const OTHER_LIMIT_PATTERN = /rate.?limit|too many requests|\b429\b|quota/i;
+const OTHER_LIMIT_PATTERN =
+  /rate.?limit|usage.?limit|too many requests|\b429\b|quota/i;
+const BUSY_CODE = 77;
 // Обёртки и приставки перед настоящей командой: env, VAR=1, timeout 600, …
 const PREFIX_TOKEN = /^(?:env|nohup|nice|exec|timeout|\w+=.*|-\S*|\d+[smhd]?)$/;
 
@@ -128,6 +135,7 @@ export function findRateLimit(
   const pattern =
     executor === "devin" ? DEVIN_LIMIT_PATTERN : OTHER_LIMIT_PATTERN;
   if (!pattern.test(tail)) return undefined;
+  // ponytail: сброс по умолчанию; брать время из сообщения Codex, если появится
   let seconds = DEFAULT_RESET_SECONDS;
   const reset = /reset in (\d+)\s*(minute|hour)/i.exec(tail);
   if (executor === "devin" && reset?.[1] !== undefined) {
@@ -168,6 +176,119 @@ export async function writeLimitFile(
   } catch (error) {
     await rm(temporary, { force: true });
     throw error;
+  }
+}
+
+/**
+ * Каталог файлов ограничений и замков:
+ * ~/.local/state/executor-limits, переопределяется EXECUTOR_LIMITS_DIR
+ * (в тестах — без трюков с HOME).
+ */
+function limitsDirectory(): string {
+  return (
+    process.env.EXECUTOR_LIMITS_DIR ??
+    path.join(homedir(), ".local", "state", "executor-limits")
+  );
+}
+
+/**
+ * Файл замка команды в каталоге замков: sha256 точной строки команды.
+ * @internal Экспорт для тестов.
+ */
+export function runLockFile(command: string[], directory: string): string {
+  const key = createHash("sha256").update(command.join(" ")).digest("hex");
+  return path.join(directory, key);
+}
+
+/**
+ * Замок: «pid\nфайл вывода\n»; нет файла или битый pid — undefined
+ * (протухший замок перезаписывается).
+ */
+async function readLock(
+  file: string,
+): Promise<{ pid: number; output: string } | undefined> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch {
+    return undefined;
+  }
+  const [pidText, ...rest] = text.split("\n");
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return { pid, output: rest.join("\n").trim() || "-" };
+}
+
+/**
+ * Файл вывода команды: цель последнего `>`/`>>` (кроме `2>`/`>&`) в строке;
+ * редиректа нет — undefined.
+ * @internal Экспорт для тестов.
+ */
+export function outputFileOf(command: string[]): string | undefined {
+  let file: string | undefined;
+  for (const match of command
+    .join(" ")
+    .matchAll(/(?<![0-9>&])>>?[ \t]*("[^"]*"|'[^']*'|[^\s;|>&"']+)/g)) {
+    file = match[1];
+  }
+  return file?.replace(/^(['"])([\s\S]*)\1$/, "$2");
+}
+
+/**
+ * Запись замка как у writeLimitFile: каталог 0700, файл 0600 через
+ * временный файл и rename.
+ */
+async function writeLock(
+  file: string,
+  pid: number,
+  output: string,
+): Promise<void> {
+  const directory = path.dirname(file);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const temporary = `${file}.tmp-${String(process.pid)}`;
+  try {
+    await writeFile(temporary, `${String(pid)}\n${output}\n`, {
+      mode: 0o600,
+    });
+    await rename(temporary, file);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * Снятие замка: только если файл всё ещё наш (pid совпадает) — чужой
+ * замок не трогаем.
+ */
+async function releaseLock(
+  file: string,
+  pid: number | undefined,
+): Promise<void> {
+  if (pid === undefined) return;
+  const held = await readLock(file);
+  if (held?.pid !== pid) return;
+  await rm(file, { force: true });
+  // подчистить опустевшие каталоги вплоть до ~/.local — успешный запуск
+  // не оставляет следов; непустой каталог останавливает подъём
+  let directory = path.dirname(file);
+  for (let depth = 0; depth < 4; depth += 1) {
+    try {
+      await rmdir(directory);
+    } catch {
+      break;
+    }
+    directory = path.dirname(directory);
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // сигнал 0 — проверка существования, ничего не шлёт
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -257,11 +378,35 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   if (binary === undefined) return 2;
   const executor = detectExecutor(arguments_.command);
   const started = Date.now();
+  // Замок на точную строку команды: координатор перезапускал ту же команду
+  // после STALLED при живом первом процессе — второй не стартует.
+  // ponytail: взятие неатомарно (чтение → spawn → запись); старт двух
+  // одинаковых команд строго одновременно проскочит — нужен O_EXCL, редкость
+  const lockFile = runLockFile(
+    arguments_.command,
+    path.join(limitsDirectory(), "locks"),
+  );
+  const held = await readLock(lockFile);
+  if (held !== undefined && isPidAlive(held.pid)) {
+    process.stdout.write(`BUSY ${String(held.pid)} ${held.output}\n`);
+    return BUSY_CODE;
+  }
   const child = spawn(binary, rest, {
     detached: true,
     stdio: ["inherit", "pipe", "pipe"],
   });
   const pgid = child.pid;
+  if (pgid !== undefined) {
+    try {
+      await writeLock(
+        lockFile,
+        pgid,
+        arguments_.watchFile ?? outputFileOf(arguments_.command) ?? "-",
+      );
+    } catch (error) {
+      process.stderr.write(`WATCHDOG: замок не записан: ${String(error)}\n`);
+    }
+  }
   const state: {
     stop?: "silence" | "ceiling";
     isFinished: boolean;
@@ -332,6 +477,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       process.off("SIGTERM", onTerm);
       process.off("SIGINT", onInterrupt);
       await exit;
+      await releaseLock(lockFile, pgid);
       return 141;
     }
     if (Date.now() - lastSample >= POLL_MS) {
@@ -402,11 +548,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     if (epoch !== undefined) {
       if (executor !== undefined) {
         try {
-          await writeLimitFile(
-            path.join(homedir(), ".local", "state", "executor-limits"),
-            executor,
-            epoch,
-          );
+          await writeLimitFile(limitsDirectory(), executor, epoch);
         } catch (error) {
           process.stderr.write(
             `WATCHDOG: файл ограничений не записан: ${String(error)}\n`,
@@ -414,15 +556,18 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
         }
       }
       process.stdout.write(`RATE_LIMIT ${String(epoch)}\n`);
+      await releaseLock(lockFile, pgid);
       return 75;
     }
   }
   if (state.stop !== undefined) {
     process.stdout.write(`STALLED ${state.stop}\n`);
+    await releaseLock(lockFile, pgid);
     return 76;
   }
   process.stdout.write(`DONE ${String(result.code)}\n`);
-  return result.code === 75 || result.code === 76 ? 1 : result.code;
+  await releaseLock(lockFile, pgid);
+  return [75, 76, BUSY_CODE].includes(result.code) ? 1 : result.code;
 }
 
 if (import.meta.main) {
