@@ -11,6 +11,22 @@ import { fileURLToPath } from "node:url";
 const RUNNER = /(?<![\w-])(?:devin|pi)\s+-p(?!\w)/;
 
 /**
+ * Куда команда отправляет вывод исполнителя: первая перенаправленная
+ * в файл стандартная выдача (`> f`, `>> f`, `1> f`, в кавычках или без)
+ * после `devin -p`/`pi -p`. Нет — undefined (вывод и так виден сторожу).
+ */
+export function outputFileOf(command: string): string | undefined {
+  const start = RUNNER.exec(command)?.index ?? 0;
+  const redirect =
+    /(?:^|[\s;])1?>>?\s*(?:'([^']+)'|"([^"]+)"|([^\s;&|<>]+))/.exec(
+      command.slice(start),
+    );
+  const target = redirect?.[1] ?? redirect?.[2] ?? redirect?.[3];
+  if (target === undefined || target.startsWith("&")) return undefined;
+  return target === "/dev/null" ? undefined : target;
+}
+
+/**
  * Ответ хука для входного JSON; пустая строка — ничего не менять.
  * @param watchdogPath абсолютный путь к `watchdog.ts`; нет файла — не оборачивать.
  */
@@ -40,12 +56,18 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
       typeof timeout === "number" && timeout > 0 ? timeout : fallbackMs;
     const limit = ` --max-seconds ${String(Math.max(30, Math.floor(timeoutMs / 1000 - 15)))}`;
     const quoted = command.replaceAll("'", String.raw`'\''`);
+    // вывод уходит в файл — сторож смотрит в него: рост — жизнь, хвост — лимит
+    const outputFile = outputFileOf(command);
+    const watch =
+      outputFile === undefined
+        ? ""
+        : ` --watch-file '${outputFile.replaceAll("'", String.raw`'\''`)}'`;
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         updatedInput: {
           ...toolInput,
-          command: `node '${watchdogPath.replaceAll("'", String.raw`'\''`)}' --silence 600${limit} -- bash -c '${quoted}'`,
+          command: `node '${watchdogPath.replaceAll("'", String.raw`'\''`)}' --silence 600${limit}${watch} -- bash -c '${quoted}'`,
         },
       },
     });

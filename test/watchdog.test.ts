@@ -451,3 +451,59 @@ void test("родитель сторожа вышел раньше задачи:
   assert.match(text, /DONE 0\s*$/);
   await rm(directory, { recursive: true, force: true });
 });
+
+void test("вывод исполнителя уходит в файл (как у раннеров): лимит ищется в --watch-file, код берётся из строки exit=", async () => {
+  const before = Math.floor(Date.now() / 1000);
+  const limitHome = await mkdtemp(path.join(tmpdir(), "watchdog-home-file-"));
+  const out = path.join(limitHome, "run.out");
+  try {
+    const result = await watchdog(
+      [
+        "--watch-file",
+        out,
+        "--",
+        "bash",
+        "-c",
+        `cd ${limitHome} && ${path.join(bin, "devin")} -p -c "echo '${LIMIT_TEXT}'; exit 1" > ${out} 2>&1; echo "exit=$?" >> ${out}`,
+      ],
+      limitHome,
+    );
+    assert.equal(result.code, 75, result.stdout);
+    const epoch = Number(/^RATE_LIMIT (\d+)$/.exec(result.lastLine)?.[1]);
+    assert.ok(Math.abs(epoch - (before + 180)) <= 10, result.lastLine);
+    const file = path.join(
+      limitHome,
+      ".local",
+      "state",
+      "executor-limits",
+      "devin",
+    );
+    assert.equal(await readFile(file, "utf8"), `${String(epoch)}\n`);
+  } finally {
+    await rm(limitHome, { recursive: true, force: true });
+  }
+});
+
+void test("вывод в файл, exit=0 и слово «rate limit» в тексте работы → DONE 0, файл лимита не пишется", async () => {
+  const limitHome = await mkdtemp(path.join(tmpdir(), "watchdog-home-ok-"));
+  const out = path.join(limitHome, "run.out");
+  try {
+    const result = await watchdog(
+      [
+        "--watch-file",
+        out,
+        "--",
+        "bash",
+        "-c",
+        `${path.join(bin, "devin")} -p -c "echo 'обработка rate limit 429 в коде'" > ${out} 2>&1; echo "exit=$?" >> ${out}`,
+      ],
+      limitHome,
+    );
+    assert.equal(result.lastLine, "DONE 0");
+    await assert.rejects(
+      stat(path.join(limitHome, ".local", "state", "executor-limits", "devin")),
+    );
+  } finally {
+    await rm(limitHome, { recursive: true, force: true });
+  }
+});

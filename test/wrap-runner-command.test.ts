@@ -33,7 +33,10 @@ function updatedInput(output: string): Record<string, unknown> {
 }
 
 void test("оборачивает devin -p и pi -p, сохраняя description и timeout", () => {
-  for (const command of ["devin -p 'задача' > out.txt", "cd /x && pi -p hi"]) {
+  for (const [command, watch] of [
+    ["devin -p 'задача' > out.txt", " --watch-file 'out.txt'"],
+    ["cd /x && pi -p hi", ""],
+  ] as const) {
     const output = wrapRunnerCommand(
       bash(command, { description: "запуск", timeout: 600_000 }),
       WATCHDOG,
@@ -41,7 +44,7 @@ void test("оборачивает devin -p и pi -p, сохраняя descriptio
     const input = updatedInput(output);
     assert.equal(
       input["command"],
-      `node '${WATCHDOG}' --silence 600 --max-seconds 585 -- bash -c '${command.replaceAll("'", String.raw`'\''`)}'`,
+      `node '${WATCHDOG}' --silence 600 --max-seconds 585${watch} -- bash -c '${command.replaceAll("'", String.raw`'\''`)}'`,
     );
     assert.equal(input["description"], "запуск");
     assert.equal(input["timeout"], 600_000);
@@ -185,4 +188,24 @@ void test("передний план без timeout: потолок по умо�
     input["command"],
     `node '${WATCHDOG}' --silence 600 --max-seconds 105 -- bash -c 'devin -p x'`,
   );
+});
+
+void test("вывод исполнителя в файл → сторож следит за файлом (--watch-file)", () => {
+  const plain = updatedInput(
+    wrapRunnerCommand(
+      bash(
+        'cd /w && devin -p --prompt-file /p.md > /tmp/run.out 2>&1; echo "exit=$?" >> /tmp/run.out',
+      ),
+      WATCHDOG,
+    ),
+  );
+  assert.match(String(plain["command"]), /--watch-file '\/tmp\/run\.out' /);
+  const quoted = updatedInput(
+    wrapRunnerCommand(bash("pi -p \"x\" >> '/a b/out.log'"), WATCHDOG),
+  );
+  assert.match(String(quoted["command"]), /--watch-file '\/a b\/out\.log' /);
+  const none = updatedInput(
+    wrapRunnerCommand(bash("devin -p x 2>&1"), WATCHDOG),
+  );
+  assert.doesNotMatch(String(none["command"]), /--watch-file/);
 });

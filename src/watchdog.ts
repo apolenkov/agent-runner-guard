@@ -8,7 +8,15 @@
  * Коды выхода: код команды (75 и 76 → 1), 75 — лимит, 76 — зависание.
  */
 import { spawn } from "node:child_process";
-import { mkdir, chmod, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { constants, homedir } from "node:os";
 import path from "node:path";
 
@@ -126,6 +134,19 @@ export function findRateLimit(
     seconds = Number(reset[1]) * (/^h/i.test(reset[2] ?? "") ? 3600 : 60);
   }
   return Math.floor(nowMs / 1000) + seconds;
+}
+
+/**
+Последние TAIL_BYTES файла как текст; нет файла или пути — пустая строка.
+*/
+async function readTail(file: string | undefined): Promise<string> {
+  if (file === undefined) return "";
+  try {
+    const content = await readFile(file);
+    return content.subarray(-TAIL_BYTES).toString("utf8");
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -366,8 +387,18 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   }
   if (!state.isNewlineEnded) process.stdout.write("\n");
 
-  if (state.stop !== undefined || result.code !== 0) {
-    const epoch = findRateLimit(tail.toString("utf8"), executor, Date.now());
+  // вывод исполнителя мог уйти в файл (`> run.out; echo exit=$? >> run.out`):
+  // тогда хвост и настоящий код выхода берутся из него
+  const fileTail = await readTail(arguments_.watchFile);
+  const fileCode = /(?:^|\n)exit=(\d+)\s*$/.exec(fileTail)?.[1];
+  const hasFailed =
+    result.code !== 0 || (fileCode !== undefined && fileCode !== "0");
+  if (hasFailed || state.stop !== undefined) {
+    const epoch = findRateLimit(
+      `${tail.toString("utf8")}\n${fileTail}`,
+      executor,
+      Date.now(),
+    );
     if (epoch !== undefined) {
       if (executor !== undefined) {
         try {
