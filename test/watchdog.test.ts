@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -8,6 +9,7 @@ import {
   rm,
   stat,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,6 +21,7 @@ import {
   detectExecutor,
   findRateLimit,
   parseWatchdogArguments,
+  runLockFile,
   writeLimitFile,
 } from "../src/watchdog.ts";
 
@@ -27,8 +30,21 @@ const WATCHDOG = fileURLToPath(new URL("../src/watchdog.ts", import.meta.url));
 const home = await mkdtemp(path.join(tmpdir(), "watchdog-home-"));
 const bin = path.join(home, "bin");
 await mkdir(bin);
-await symlink("/bin/sh", path.join(bin, "devin"));
+// синтетический devin: скипает -p и --prompt-file <путь>, остальное — через sh
+const devinScript = path.join(bin, "devin");
+await writeFile(
+  devinScript,
+  '#!/bin/sh\nwhile :; do case "$1" in -p) shift;; --prompt-file) shift 2;; *) break;; esac; done\nexec /bin/sh "$@"\n',
+);
+await chmod(devinScript, 0o755);
 await symlink("/bin/sh", path.join(bin, "pi"));
+// синтетический codex: сбрасывает подкоманду exec и шьёт остальное через sh
+const codexScript = path.join(bin, "codex");
+await writeFile(
+  codexScript,
+  '#!/bin/sh\n[ "$1" = "exec" ] && shift\nexec /bin/sh "$@"\n',
+);
+await chmod(codexScript, 0o755);
 
 after(async () => {
   await rm(home, { recursive: true, force: true });
@@ -45,11 +61,15 @@ interface Result {
 /**
  * Запуск сторожа как отдельного процесса с HOME во временном каталоге.
  */
-function watchdog(arguments_: string[], homeDirectory = home): Promise<Result> {
+function watchdog(
+  arguments_: string[],
+  homeDirectory = home,
+  environment: Record<string, string> = {},
+): Promise<Result> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const child = spawn(process.execPath, [WATCHDOG, ...arguments_], {
-      env: { ...process.env, HOME: homeDirectory },
+      env: { ...process.env, HOME: homeDirectory, ...environment },
     });
     let stdout = "";
     let stderr = "";
@@ -296,7 +316,9 @@ void test("не лимит: «429» в выводе при коде 0 → DONE 0
     );
     assert.equal(result.code, 0);
     assert.equal(result.lastLine, "DONE 0");
-    await assert.rejects(stat(path.join(other, ".local")));
+    await assert.rejects(
+      stat(path.join(other, ".local", "state", "executor-limits")),
+    );
   } finally {
     await rm(other, { recursive: true, force: true });
   }
@@ -311,7 +333,9 @@ void test("devin с «quota» в обычном выводе и кодом 1 →
     );
     assert.equal(result.code, 1);
     assert.equal(result.lastLine, "DONE 1");
-    await assert.rejects(stat(path.join(other, ".local")));
+    await assert.rejects(
+      stat(path.join(other, ".local", "state", "executor-limits")),
+    );
   } finally {
     await rm(other, { recursive: true, force: true });
   }
@@ -328,6 +352,369 @@ void test("pi с «quota» и кодом 1 → RATE_LIMIT", async () => {
     assert.match(result.lastLine, /^RATE_LIMIT \d+$/);
   } finally {
     await rm(other, { recursive: true, force: true });
+  }
+});
+
+void test("RATE_LIMIT codex: «usage limit», «RateLimitReached», «usage_limited» → 75, файл codex", async () => {
+  for (const phrase of [
+    "You've hit your usage limit",
+    "RateLimitReached",
+    "usage_limited",
+  ]) {
+    const other = await mkdtemp(path.join(tmpdir(), "watchdog-codex-"));
+    try {
+      const before = Math.floor(Date.now() / 1000);
+      const result = await watchdog(
+        ["--", codexScript, "exec", "-c", `echo "${phrase}"; exit 1`],
+        other,
+      );
+      assert.equal(result.code, 75, phrase);
+      const epoch = Number(/^RATE_LIMIT (\d+)$/.exec(result.lastLine)?.[1]);
+      assert.ok(
+        Math.abs(epoch - (before + 1800)) <= 10,
+        `${phrase}: ${String(epoch - before)}`,
+      );
+      const file = path.join(
+        other,
+        ".local",
+        "state",
+        "executor-limits",
+        "codex",
+      );
+      assert.equal(await readFile(file, "utf8"), `${String(epoch)}\n`, phrase);
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
+  }
+});
+
+/**
+ * Содержимое каталога или пустой список, когда его нет.
+ */
+async function directoryNames(directory: string): Promise<string[]> {
+  try {
+    return await readdir(directory);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Ждём появления файла замка (<base>/locks/<ключ>) и читаем
+ * «pgid\npid сторожа\nфайл вывода» — после перезаписи с pgid.
+ */
+async function waitLock(
+  directory: string,
+): Promise<{ pgid: number; pid: number; output: string }> {
+  const locks = path.join(
+    directory,
+    ".local",
+    "state",
+    "executor-limits",
+    "locks",
+  );
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const names = await directoryNames(locks);
+    const name = names.find((item) => !item.includes(".tmp-"));
+    if (name !== undefined) {
+      const text = await readFile(path.join(locks, name), "utf8");
+      const [pgidText, pidText, ...rest] = text.split("\n");
+      const pgid = Number(pgidText);
+      const pid = Number(pidText);
+      if (Number.isSafeInteger(pgid) && pgid > 0) {
+        return { pgid, pid, output: rest.join("\n").trim() };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("замок не появился");
+}
+
+void test("BUSY: та же команда при живом первом запуске → код 77, строка BUSY; после завершения — стартует", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-busy-"));
+  const outFile = path.join(directory, "run.out");
+  const arguments_ = [
+    "--silence",
+    "30",
+    "--",
+    "sh",
+    "-c",
+    `sleep 4.23 > '${outFile}'`,
+  ];
+  const first = spawn(process.execPath, [WATCHDOG, ...arguments_], {
+    env: { ...process.env, HOME: directory },
+    stdio: "ignore",
+  });
+  try {
+    const lock = await waitLock(directory);
+    assert.equal(lock.output, outFile);
+    const second = await watchdog(arguments_, directory);
+    assert.equal(second.code, 77);
+    assert.equal(second.lastLine, `BUSY ${String(lock.pgid)} ${outFile}`);
+    // другая команда — не дубликат: запускается свободно
+    const other = await watchdog(["--", "sh", "-c", "echo иначе"], directory);
+    assert.equal(other.lastLine, "DONE 0");
+    // первый дошёл до конца: замок снят, команда снова стартует
+    await new Promise((resolve) => first.on("close", resolve));
+    const third = await watchdog(arguments_, directory);
+    assert.equal(third.lastLine, "DONE 0");
+    // замок и его каталоги подчищены (выше базы не поднимаемся)
+    await assert.rejects(
+      stat(path.join(directory, ".local", "state", "executor-limits")),
+    );
+  } finally {
+    first.kill("SIGKILL"); // при провале теста; обычно уже завершён
+    await killMarked("sleep 4.23");
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("BUSY: замок с мёртвым pid — протухший, команда стартует, замок перезаписан и снят", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-stale-"));
+  try {
+    // гарантированно мёртвый pid: процесс уже завершился
+    const dead = spawn("true", []);
+    await new Promise((resolve) => dead.on("exit", resolve));
+    const deadPid = dead.pid ?? 1;
+    const command = ["sh", "-c", "echo ok"];
+    const locks = path.join(
+      directory,
+      ".local",
+      "state",
+      "executor-limits",
+      "locks",
+    );
+    await mkdir(locks, { recursive: true });
+    const file = runLockFile(command, locks);
+    await writeFile(file, `0\n${String(deadPid)}\nold.out\n`);
+    const result = await watchdog(["--", ...command], directory);
+    assert.equal(result.lastLine, "DONE 0");
+    // замок и его каталоги подчищены (выше базы не поднимаемся)
+    await assert.rejects(
+      stat(path.join(directory, ".local", "state", "executor-limits")),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("BUSY: каталог ограничений переопределяется EXECUTOR_LIMITS_DIR", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-env-"));
+  const limits = path.join(directory, "custom-limits");
+  const arguments_ = ["--silence", "30", "--", "sh", "-c", "sleep 4.23"];
+  const first = spawn(process.execPath, [WATCHDOG, ...arguments_], {
+    env: { ...process.env, HOME: directory, EXECUTOR_LIMITS_DIR: limits },
+    stdio: "ignore",
+  });
+  try {
+    // замок появился в переопределённом каталоге
+    const locks = path.join(limits, "locks");
+    let file: string | undefined;
+    for (let attempt = 0; file === undefined && attempt < 100; attempt += 1) {
+      const names = await directoryNames(locks);
+      file = names.find((item) => !item.includes(".tmp-"));
+      if (file === undefined)
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(file !== undefined, "замок не появился в EXECUTOR_LIMITS_DIR");
+    const second = await watchdog(arguments_, directory, {
+      EXECUTOR_LIMITS_DIR: limits,
+    });
+    assert.equal(second.code, 77);
+    assert.match(second.lastLine, /^BUSY \d+ /);
+  } finally {
+    first.kill("SIGKILL");
+    await killMarked("sleep 4.23");
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("runLockFile: ключ — исполнитель + prompt-файл, редиректы вывода не влияют", () => {
+  const directory = "/tmp/locks";
+  const key = runLockFile(
+    ["bash", "-c", "cd /w && devin -p --prompt-file t.md > run24"],
+    directory,
+    "devin",
+  );
+  // тот же prompt-файл при другом «> файл» — тот же замок
+  assert.equal(
+    key,
+    runLockFile(
+      ["bash", "-c", "cd /w && devin -p --prompt-file t.md > run24-new 2>&1"],
+      directory,
+      "devin",
+    ),
+  );
+  // обёртка bash -c и cd не меняют абсолютный путь
+  assert.equal(
+    key,
+    runLockFile(
+      ["devin", "-p", "--prompt-file", "/w/t.md"],
+      directory,
+      "devin",
+    ),
+  );
+  // другой prompt-файл — другой замок
+  assert.notEqual(
+    key,
+    runLockFile(
+      ["bash", "-c", "cd /w && devin -p --prompt-file t2.md > run24"],
+      directory,
+      "devin",
+    ),
+  );
+  // без prompt-файла: редиректы вывода не входят в ключ
+  assert.equal(
+    runLockFile(["sh", "-c", "sleep 1 > /tmp/a"], directory),
+    runLockFile(["sh", "-c", "sleep 1 >> /tmp/b 2>&1"], directory),
+  );
+  // «cd <dir> &&» — часть идентичности
+  assert.notEqual(
+    runLockFile(["sh", "-c", "cd /a && sleep 1 > x"], directory),
+    runLockFile(["sh", "-c", "cd /b && sleep 1 > x"], directory),
+  );
+  // исполнитель — часть ключа
+  assert.notEqual(
+    runLockFile(
+      ["devin", "-p", "--prompt-file", "/w/t.md"],
+      directory,
+      "devin",
+    ),
+    runLockFile(["pi", "--prompt-file", "/w/t.md"], directory, "pi"),
+  );
+});
+
+void test("BUSY: тот же --prompt-file с другим «> файл» — тот же замок, повтор не стартует", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-promptkey-"));
+  const prompt = path.join(directory, "task.md");
+  const otherPrompt = path.join(directory, "other.md");
+  await writeFile(prompt, "x");
+  await writeFile(otherPrompt, "y");
+  const devin = path.join(bin, "devin");
+  const make = (out: string) => [
+    "--",
+    "bash",
+    "-c",
+    `${devin} -p --prompt-file '${prompt}' -c 'sleep 4.23' > '${out}'`,
+  ];
+  const first = spawn(
+    process.execPath,
+    [WATCHDOG, ...make(path.join(directory, "run24"))],
+    { env: { ...process.env, HOME: directory }, stdio: "ignore" },
+  );
+  try {
+    const lock = await waitLock(directory);
+    // тот же prompt-файл, другой файл вывода — дубликат
+    const second = await watchdog(
+      make(path.join(directory, "run24-new")),
+      directory,
+    );
+    assert.equal(second.code, 77);
+    assert.equal(
+      second.lastLine,
+      `BUSY ${String(lock.pgid)} ${path.join(directory, "run24")}`,
+    );
+    // другой prompt-файл — не дубликат
+    const third = await watchdog(
+      [
+        "--",
+        "bash",
+        "-c",
+        `${devin} -p --prompt-file '${otherPrompt}' -c 'echo ok' > '${path.join(directory, "run24")}'`,
+      ],
+      directory,
+    );
+    assert.equal(third.lastLine, "DONE 0");
+  } finally {
+    first.kill("SIGKILL");
+    await killMarked("sleep 4.23");
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("BUSY: два сторожа с той же командой одновременно — ровно один BUSY, второй DONE", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-race-"));
+  const arguments_ = ["--", "sh", "-c", "sleep 1.5; echo winner"];
+  try {
+    const [a, b] = await Promise.all([
+      watchdog(arguments_, directory),
+      watchdog(arguments_, directory),
+    ]);
+    const codes = [a.code, b.code].toSorted(
+      (left, right) => (left ?? -1) - (right ?? -1),
+    );
+    assert.deepEqual(codes, [0, 77], `a=${String(a.code)} b=${String(b.code)}`);
+    const busy = a.code === 77 ? a : b;
+    assert.match(busy.lastLine, /^BUSY \d+ /);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("STALLED: группа пережила остановку — замок остаётся, повтор той же команды → BUSY", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-stalled-"));
+  // perl уходит в свою группу и не ждёт ребёнка: зомби держит pgid первой
+  // группы «живым» для kill(-pgid, 0) и после SIGKILL сторожа
+  const arguments_ = [
+    "--silence",
+    "2",
+    "--",
+    "sh",
+    "-c",
+    `perl -e '$k=fork; if($k==0){sleep 0.1; exit 0} setpgrp(0,0); sleep 611.31' & exec sleep 611.31`,
+  ];
+  try {
+    const first = await watchdog(arguments_, directory);
+    assert.equal(first.code, 76);
+    assert.equal(first.lastLine, "STALLED silence");
+    const second = await watchdog(arguments_, directory);
+    assert.equal(second.code, 77);
+    assert.match(second.lastLine, /^BUSY \d+ /);
+  } finally {
+    await killMarked("setpgrp");
+    await killMarked("sleep 611.31");
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("замок: чистка каталогов не поднимается выше базы EXECUTOR_LIMITS_DIR", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-cleanup-"));
+  const limits = path.join(directory, "deep", "nested", "limits");
+  try {
+    const result = await watchdog(["--", "sh", "-c", "echo ok"], directory, {
+      EXECUTOR_LIMITS_DIR: limits,
+    });
+    assert.equal(result.lastLine, "DONE 0");
+    // locks и сама база подчищены, родители базы — на месте
+    await assert.rejects(stat(limits));
+    await stat(path.join(directory, "deep", "nested"));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("pi с «usageLimit»/«usage-limit»/«usage_limit» в выводе и кодом 1 → не лимит", async () => {
+  for (const phrase of ["usageLimit", "usage-limit", "usage_limit"]) {
+    const other = await mkdtemp(path.join(tmpdir(), "watchdog-usagelimit-"));
+    try {
+      const result = await watchdog(
+        [
+          "--",
+          path.join(bin, "pi"),
+          "-c",
+          `echo 'code has ${phrase} = 1'; exit 1`,
+        ],
+        other,
+      );
+      assert.equal(result.code, 1, phrase);
+      assert.equal(result.lastLine, "DONE 1", phrase);
+      await assert.rejects(
+        stat(path.join(other, ".local", "state", "executor-limits", "pi")),
+        phrase,
+      );
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
   }
 });
 
@@ -368,8 +755,18 @@ void test("detectExecutor: прямая команда, sh -c со строко�
     );
   }
   assert.equal(detectExecutor(["env", "X=1", "devin", "-p", "x"]), "devin");
+  assert.equal(detectExecutor(["codex", "exec", "задача"]), "codex");
+  assert.equal(detectExecutor(["codex", "exec", "review", "план"]), "codex");
+  assert.equal(detectExecutor(["/usr/local/bin/codex", "exec", "x"]), "codex");
+  assert.equal(
+    detectExecutor(["bash", "-c", "cd /x && codex exec 't' > run.out"]),
+    "codex",
+  );
   assert.equal(detectExecutor(["bash", "-c", "echo 5 devin -p"]), undefined);
   assert.equal(detectExecutor(["devin", "--version"]), undefined);
+  assert.equal(detectExecutor(["codex"]), undefined);
+  assert.equal(detectExecutor(["codex", "--version"]), undefined);
+  assert.equal(detectExecutor(["codex", "exec-foo", "x"]), undefined);
   assert.equal(detectExecutor(["sh", "-c", "ls -la"]), undefined);
   assert.equal(detectExecutor(["sleep", "1"]), undefined);
 });
@@ -396,6 +793,32 @@ void test("findRateLimit: признак ищется в хвосте, reset in 
   assert.equal(findRateLimit("generic rate limit", "devin", now), undefined);
   assert.ok(findRateLimit("quota exceeded", "pi", now) !== undefined);
   assert.ok(findRateLimit("quota exceeded", undefined, now) !== undefined);
+  assert.equal(
+    findRateLimit("You've hit your usage limit", "codex", now),
+    1_000_000_000 + 1800,
+  );
+  assert.equal(
+    findRateLimit("RateLimitReached", "codex", now),
+    1_000_000_000 + 1800,
+  );
+  assert.equal(
+    findRateLimit("usage limit exceeded", "codex", now),
+    1_000_000_000 + 1800,
+  );
+  assert.equal(
+    findRateLimit("usage_limit_reached", "codex", now),
+    1_000_000_000 + 1800,
+  );
+  assert.equal(
+    findRateLimit("usage_limited", "codex", now),
+    1_000_000_000 + 1800,
+  );
+  // usage.?limit — идентификаторы и обычный текст: для pi не лимит
+  assert.equal(findRateLimit("usageLimit", "pi", now), undefined);
+  assert.equal(findRateLimit("usage-limit", "pi", now), undefined);
+  assert.equal(findRateLimit("usage_limit", "pi", now), undefined);
+  assert.equal(findRateLimit("usage limit exceeded", "pi", now), undefined);
+  assert.equal(findRateLimit("usage_limited", "pi", now), undefined);
   assert.equal(findRateLimit("всё хорошо", "devin", now), undefined);
   assert.equal(findRateLimit("порт 4290 занят", "devin", now), undefined);
 });

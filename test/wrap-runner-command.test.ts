@@ -92,13 +92,31 @@ void test("run_in_background: потолок тоже по таймауту Bash
   );
 });
 
-void test("не трогает ls, git status, devin --version, pipe -p", () => {
+void test("оборачивает codex exec и codex exec review", () => {
+  for (const [command, watch] of [
+    ["codex exec 'задача' > out.txt", " --watch-file 'out.txt'"],
+    ["cd /x && codex exec review 'план'", ""],
+  ] as const) {
+    const input = updatedInput(wrapRunnerCommand(bash(command), WATCHDOG));
+    assert.equal(
+      input["command"],
+      `node '${WATCHDOG}' --silence 600 --max-seconds 105${watch} -- bash -c '${command.replaceAll("'", String.raw`'\''`)}'`,
+      command,
+    );
+  }
+});
+
+void test("не трогает ls, git status, devin --version, pipe -p, codex без exec", () => {
   for (const command of [
     "ls",
     "git status",
     "devin --version",
     "pipe -p x",
     "echo happi -p",
+    "codex --version",
+    "codex",
+    "mycodex exec x",
+    "codex-foo exec x",
   ]) {
     assert.equal(wrapRunnerCommand(bash(command), WATCHDOG), "", command);
   }
