@@ -12,6 +12,9 @@ const HOOK = fileURLToPath(
   new URL("../src/hooks/wrap-runner-command.ts", import.meta.url),
 );
 const WATCHDOG = fileURLToPath(new URL("../src/watchdog.ts", import.meta.url));
+const PI_ALERT = fileURLToPath(
+  new URL("../src/harness/pi-alert.ts", import.meta.url),
+);
 
 function bash(command: string, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -34,9 +37,13 @@ function updatedInput(output: string): Record<string, unknown> {
 }
 
 void test("оборачивает devin -p и pi -p, сохраняя description и timeout", () => {
-  for (const [command, watch] of [
-    ["devin -p 'задача' > out.txt", " --watch-file '/work/repo/out.txt'"],
-    ["cd /x && pi -p hi", ""],
+  for (const [command, expected, watch] of [
+    [
+      "devin -p 'задача' > out.txt",
+      "devin -p 'задача' > out.txt",
+      " --watch-file '/work/repo/out.txt'",
+    ],
+    ["cd /x && pi -p hi", `cd /x && pi -e '${PI_ALERT}' -p hi`, ""],
   ] as const) {
     const output = wrapRunnerCommand(
       bash(command, { description: "запуск", timeout: 600_000 }),
@@ -45,7 +52,7 @@ void test("оборачивает devin -p и pi -p, сохраняя descriptio
     const input = updatedInput(output);
     assert.equal(
       input["command"],
-      `node '${WATCHDOG}' --silence 600 --max-seconds 585${watch} -- bash -c '${command.replaceAll("'", String.raw`'\''`)}'`,
+      `node '${WATCHDOG}' --silence 600 --max-seconds 585${watch} -- bash -c '${expected.replaceAll("'", String.raw`'\''`)}'`,
     );
     assert.equal(input["description"], "запуск");
     assert.equal(input["timeout"], 600_000);
@@ -261,4 +268,33 @@ void test("относительный файл вывода разрешаетс
     wrapRunnerCommand(bash("cd $WORK && devin -p x > r.out"), WATCHDOG),
   );
   assert.doesNotMatch(String(viaVariable["command"]), /--watch-file/);
+});
+
+function wrapped(command: string): unknown {
+  return updatedInput(wrapRunnerCommand(bash(command), WATCHDOG))["command"];
+}
+
+void test("pi -p получает расширение pi-alert (-e), devin и codex — нет", () => {
+  const inner = `cd /x && pi -e '${PI_ALERT}' -p hi > o.log; echo pi -p`;
+  assert.ok(
+    String(wrapped("cd /x && pi -p hi > o.log; echo pi -p")).endsWith(
+      ` -- bash -c '${inner.replaceAll("'", String.raw`'\''`)}'`,
+    ),
+  );
+  assert.doesNotMatch(String(wrapped("devin -p x")), /pi-alert/);
+  assert.doesNotMatch(String(wrapped("codex exec x")), /pi-alert/);
+});
+
+void test("нет файла расширения рядом со сторожем → pi -p без -e", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "wrap-no-ext-"));
+  try {
+    const watchdog = path.join(directory, "watchdog.ts");
+    await writeFile(watchdog, "");
+    const command = updatedInput(wrapRunnerCommand(bash("pi -p hi"), watchdog))[
+      "command"
+    ];
+    assert.match(String(command), / -- bash -c 'pi -p hi'$/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

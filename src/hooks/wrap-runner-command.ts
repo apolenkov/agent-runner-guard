@@ -1,7 +1,7 @@
 /**
  * Хук Claude Code PreToolUse (Bash): команды `devin -p`, `pi -p` и
  * `codex exec` оборачиваются в сторож запусков (`src/watchdog.ts`) через
- * `updatedInput`.
+ * `updatedInput`; к `pi -p` добавляется расширение `src/harness/pi-alert.ts`.
  * JSON со стандартного ввода → JSON со стандартного вывода. Хук никогда не
  * блокирует: любой сбой, чужая команда или отсутствие сторожа → пустой
  * вывод и код 0 (команда идёт как есть).
@@ -77,7 +77,20 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
     const timeoutMs =
       typeof timeout === "number" && timeout > 0 ? timeout : fallbackMs;
     const limit = ` --max-seconds ${String(Math.max(30, Math.floor(timeoutMs / 1000 - 15)))}`;
-    const quoted = command.replaceAll("'", String.raw`'\''`);
+    // Pi: расширение сообщает сторожу об ошибке/лимите (alert-файл)
+    const extension = path.join(
+      path.dirname(watchdogPath),
+      "harness",
+      "pi-alert.ts",
+    );
+    const runner = existsSync(extension)
+      ? command.replace(
+          /(?<![\w-])pi(\s+)-p(?!\w)/,
+          (_match, space: string) =>
+            `pi -e '${extension.replaceAll("'", String.raw`'\''`)}'${space}-p`,
+        )
+      : command;
+    const quoted = runner.replaceAll("'", String.raw`'\''`);
     // вывод уходит в файл — сторож смотрит в него: рост — жизнь, хвост — лимит
     const outputFile = outputFileOf(
       command,
