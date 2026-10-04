@@ -297,7 +297,8 @@ async function markOf(file: string | undefined): Promise<FileMark> {
 
 /**
  * Новое в файле после отметки до запуска (прошлый вывод `>>` не событие;
- * файл перезаписан — с начала), не больше `limit` байт с конца; обрезанное
+ * файл стал короче отметки или сменились её края — перезаписан, отметка
+ * сбрасывается в 0 навсегда), не больше `limit` байт с конца; обрезанное
  * спереди окно теряет неполную первую строку. undefined — размер не
  * менялся с прошлого чтения (`seen`).
  */
@@ -316,12 +317,15 @@ async function readNew(
       const { size } = await handle.stat();
       if (seen.get(file) === size) return undefined;
       seen.set(file, size);
-      let base = 0;
-      if (size >= mark.size) {
+      if (size < mark.size) mark.size = 0; // `>` перезаписал: дальше — всё новое
+      if (mark.size > 0) {
         const edge = Buffer.alloc(mark.edge.length);
         await handle.read(edge, 0, edge.length, mark.size - edge.length);
-        if (edge.equals(mark.edge)) base = mark.size;
+        if (!edge.equals(mark.edge)) mark.size = 0;
       }
+      // ponytail: перезапись тем же текстом длиннее старого быстрее тика
+      // (200 мс) неотличима от дописывания; настоящие раннеры пишут через секунды
+      const base = mark.size;
       const start = Math.max(base, size - limit);
       const buffer = Buffer.alloc(size - start);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
@@ -540,24 +544,6 @@ async function readLock(file: string): Promise<LockContent | undefined> {
     pid: lockNumber(pidText),
     output: rest.join("\n").trim() || "-",
   };
-}
-
-/**
- * Дописывает ли команда в файл: по первому редиректу (`>`/`>>`), цель
- * которого совпадает с файлом по имени. Редиректа нет — undefined.
- */
-function appendsTo(
-  command: string[],
-  file: string | undefined,
-): boolean | undefined {
-  if (file === undefined) return undefined;
-  for (const match of command
-    .join(" ")
-    .matchAll(/(?<![0-9>&])(>>?)[ \t]*("[^"]*"|'[^']*'|[^\s;|>&"']+)/g)) {
-    const target = (match[2] ?? "").replace(/^(['"])([\s\S]*)\1$/, "$2");
-    if (path.basename(target) === path.basename(file)) return match[1] === ">>";
-  }
-  return undefined;
 }
 
 /**
@@ -865,13 +851,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     );
     return BUSY_CODE;
   }
-  // файл вывода: первый редирект `>` перезаписывает — читать с начала;
-  // `>>` — только дописанное; неизвестно — по отметке (размер и края)
-  const append = appendsTo(arguments_.command, arguments_.watchFile);
-  const watchFrom =
-    append === false
-      ? { size: 0, edge: Buffer.alloc(0) }
-      : await markOf(arguments_.watchFile);
+  const watchFrom = await markOf(arguments_.watchFile);
   const alertFrom = await markOf(arguments_.alertFile);
   // stdin — /dev/null: неинтерактивному раннеру ввод не нужен, а `pi -p`
   // иначе молча висит на чтении stdin Bash-инструмента

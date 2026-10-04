@@ -71,6 +71,15 @@ function withPiExtension(command: string, extension: string): string {
 }
 
 /**
+ * Есть ли heredoc (`<<` вне кавычек): его тело не разбираем.
+ */
+function hasHeredoc(command: string): boolean {
+  return command
+    .matchAll(/<</g)
+    .some((match) => !isQuotedAt(command, match.index));
+}
+
+/**
  * Стоит ли позиция внутри кавычек оболочки (с учётом `\` вне одинарных).
  */
 function isQuotedAt(line: string, position: number): boolean {
@@ -123,7 +132,7 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
     );
     // heredoc (`<<`) не разбираем: его тело не трогаем, расширения не будет
     const runner =
-      existsSync(extension) && !command.includes("<<")
+      existsSync(extension) && !hasHeredoc(command)
         ? withPiExtension(command, extension)
         : command;
     const quoted = runner.replaceAll("'", String.raw`'\''`);

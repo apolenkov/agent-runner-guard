@@ -1539,7 +1539,8 @@ void test("повторный запуск перезаписывает (>) фа
           "--",
           "bash",
           "-c",
-          `${path.join(bin, "devin")} -p -c "echo '${DEVIN_REJECTED}'" > ${out} 2>&1; echo "exit=$?" >> ${out}`,
+          // настоящий раннер пишет не раньше чем через секунды после старта
+          `${path.join(bin, "devin")} -p -c "sleep 0.5; echo '${DEVIN_REJECTED}'" > ${out} 2>&1; echo "exit=$?" >> ${out}`,
         ],
         directory,
       );
@@ -1569,6 +1570,28 @@ void test("живой лимит: «reset in» дальше 120 символов
     );
     const epoch = Number(/^RATE_LIMIT (\d+)$/.exec(result.lastLine)?.[1]);
     assert.ok(Math.abs(epoch - (before + 180)) <= 10, result.lastLine);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("старый отказ в файле, команда перезапишет его позже (sleep; > файл) → DONE 0", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-late-"));
+  const out = path.join(directory, "run.out");
+  try {
+    await writeFile(out, `${DEVIN_REJECTED}\n`);
+    const result = await watchdog(
+      [
+        "--watch-file",
+        out,
+        "--",
+        "bash",
+        "-c",
+        `sleep 1; ${path.join(bin, "devin")} -p -c "echo ok" > ${out} 2>&1`,
+      ],
+      directory,
+    );
+    assert.equal(result.lastLine, "DONE 0", result.stdout);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

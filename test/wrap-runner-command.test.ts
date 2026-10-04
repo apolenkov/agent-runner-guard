@@ -330,3 +330,7 @@ void test("heredoc в команде — расширение не добавл�
   const command = "cat > p.txt <<'EOF'\npi -p hi\nEOF\npi -p @p.txt";
   assert.doesNotMatch(String(wrapped(command)), /pi-alert/);
 });
+
+void test("<< внутри кавычек промпта — не heredoc, расширение добавляется", () => {
+  assert.match(String(wrapped("pi -p 'explain x << 2'")), /pi-alert/);
+});
