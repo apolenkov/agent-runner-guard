@@ -66,9 +66,16 @@ void test("pi-alert: ошибка после ретраев → error с тек�
 });
 
 void test("pi-alert: без HARNESS_ALERT_FILE подписок нет", () => {
-  const pi = fakePi();
-  piAlert(pi, undefined);
-  assert.deepEqual(pi.names(), []);
+  // тесты сами могут идти под сторожем, который задаёт переменную
+  const saved = process.env.HARNESS_ALERT_FILE;
+  delete process.env.HARNESS_ALERT_FILE;
+  try {
+    const pi = fakePi();
+    piAlert(pi);
+    assert.deepEqual(pi.names(), []);
+  } finally {
+    if (saved !== undefined) process.env.HARNESS_ALERT_FILE = saved;
+  }
 });
 
 void test("pi-alert: сбой записи не роняет Pi", () => {

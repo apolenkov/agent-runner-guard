@@ -48,6 +48,37 @@ export function outputFileOf(
 }
 
 /**
+ * Добавляет `-e <расширение>` к первому `pi -p` в позиции команды (начало
+ * строки или после `;`, `&`, `|`, `(`) и вне кавычек: текст промпта и
+ * `echo 'pi -p'` не трогаются. Подходящего нет — строка как есть.
+ */
+function withPiExtension(command: string, extension: string): string {
+  for (const match of command.matchAll(
+    /(?<=(?:^|[;&|(\n])\s*)pi(\s+)-p(?!\w)/g,
+  )) {
+    if (isQuotedAt(command, match.index)) continue;
+    const quoted = extension.replaceAll("'", String.raw`'\''`);
+    return `${command.slice(0, match.index)}pi -e '${quoted}'${match[1] ?? " "}-p${command.slice(match.index + match[0].length)}`;
+  }
+  return command;
+}
+
+/**
+ * Стоит ли позиция внутри кавычек оболочки (с учётом `\` вне одинарных).
+ */
+function isQuotedAt(line: string, position: number): boolean {
+  let quote: string | undefined;
+  for (let index = 0; index < position; index += 1) {
+    const char = line[index];
+    if (char === "\\" && quote !== "'") index += 1;
+    else if (quote === undefined && (char === "'" || char === '"'))
+      quote = char;
+    else if (char === quote) quote = undefined;
+  }
+  return quote !== undefined;
+}
+
+/**
  * Ответ хука для входного JSON; пустая строка — ничего не менять.
  * @param watchdogPath абсолютный путь к `watchdog.ts`; нет файла — не оборачивать.
  */
@@ -84,11 +115,7 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
       "pi-alert.ts",
     );
     const runner = existsSync(extension)
-      ? command.replace(
-          /(?<![\w-])pi(\s+)-p(?!\w)/,
-          (_match, space: string) =>
-            `pi -e '${extension.replaceAll("'", String.raw`'\''`)}'${space}-p`,
-        )
+      ? withPiExtension(command, extension)
       : command;
     const quoted = runner.replaceAll("'", String.raw`'\''`);
     // вывод уходит в файл — сторож смотрит в него: рост — жизнь, хвост — лимит

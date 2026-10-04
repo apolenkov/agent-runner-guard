@@ -281,6 +281,16 @@ void test("pi -p получает расширение pi-alert (-e), devin и c
       ` -- bash -c '${inner.replaceAll("'", String.raw`'\''`)}'`,
     ),
   );
+  // текст в кавычках — не команда: промпт не меняется, инструментируется настоящий pi
+  assert.doesNotMatch(
+    String(wrapped("codex exec 'Explain pi -p'")),
+    /pi-alert/,
+  );
+  assert.ok(
+    String(wrapped("echo 'pi -p'; pi -p hi")).endsWith(
+      String.raw` -- bash -c 'echo '\''pi -p'\''; pi -e '\''${PI_ALERT}'\'' -p hi'`,
+    ),
+  );
   assert.doesNotMatch(String(wrapped("devin -p x")), /pi-alert/);
   assert.doesNotMatch(String(wrapped("codex exec x")), /pi-alert/);
 });

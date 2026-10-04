@@ -1380,3 +1380,84 @@ void test("liveEvent: только завершённые строки, обре
     undefined,
   );
 });
+
+// Ревью Codex (TASK-271): прошлый вывод, смешение потоков, относительный путь, маска.
+
+void test("старые строки в дописываемом файле (>>) не событие: новый здоровый запуск → DONE 0", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-append-"));
+  const out = path.join(directory, "run.out");
+  try {
+    await writeFile(out, `${DEVIN_REJECTED}\n${LIMIT_TEXT}\n`);
+    const result = await watchdog(
+      [
+        "--watch-file",
+        out,
+        "--",
+        "bash",
+        "-c",
+        `${path.join(bin, "devin")} -p -c "echo работа; sleep 1" >> ${out} 2>&1`,
+      ],
+      directory,
+    );
+    assert.equal(result.lastLine, "DONE 0", result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("stdout без перевода строки не ломает начало строки в stderr → WAITING", async () => {
+  const result = await watchdog([
+    "--max-seconds",
+    "30",
+    "--",
+    path.join(bin, "devin"),
+    "-p",
+    "-c",
+    `printf 'working...'; sleep 0.3; echo '${DEVIN_REJECTED}' >&2; sleep 60`,
+  ]);
+  assert.equal(result.code, 78, result.stdout);
+});
+
+void test("относительный --alert-file: команда сменила каталог — событие всё равно видно", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-rel-"));
+  try {
+    await mkdir(path.join(directory, "sub"));
+    const event = JSON.stringify({ type: "error", message: "boom" });
+    const child = spawn(
+      process.execPath,
+      [
+        WATCHDOG,
+        "--alert-file",
+        "events.jsonl",
+        "--",
+        "sh",
+        "-c",
+        `cd sub && echo '${event}' >> "$HARNESS_ALERT_FILE"`,
+      ],
+      { cwd: directory, env: { ...process.env, HOME: home } },
+    );
+    let stdout = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    await new Promise<void>((resolve) => {
+      child.on("close", () => {
+        resolve();
+      });
+    });
+    assert.match(stdout, /FAILED boom\n$/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("сообщение события маскируется (ключи не печатаются)", async () => {
+  const secret = ["sk", "live", "abcdef123456"].join("-");
+  const event = JSON.stringify({ type: "error", message: `api_key=${secret}` });
+  const result = await watchdog([
+    "--",
+    "sh",
+    "-c",
+    `echo '${event}' >> "$HARNESS_ALERT_FILE"`,
+  ]);
+  assert.equal(result.code, 79, result.stdout);
+  assert.doesNotMatch(result.stdout, new RegExp(secret));
+});

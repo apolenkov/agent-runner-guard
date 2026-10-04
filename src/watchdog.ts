@@ -34,6 +34,7 @@ import {
 import { constants, homedir } from "node:os";
 import path from "node:path";
 
+import { mask } from "./mask.ts";
 import { listProcesses } from "./proc.ts";
 import { readTail } from "./tail.ts";
 import {
@@ -130,7 +131,9 @@ export function parseWatchdogArguments(argv: string[]): WatchdogArguments {
     const value = options[index + 1];
     if (value === undefined) throw new Error(`у ${String(name)} нет значения`);
     if (name === "--watch-file" || name === "--alert-file") {
-      result[name === "--watch-file" ? "watchFile" : "alertFile"] = value;
+      // alert-файл — абсолютный: команда может сменить каталог
+      if (name === "--watch-file") result.watchFile = value;
+      else result.alertFile = path.resolve(value);
     } else if (name === "--silence" || name === "--max-seconds") {
       const seconds = Number(value);
       if (!Number.isFinite(seconds) || seconds <= 0) {
@@ -204,7 +207,7 @@ export function findRateLimit(
  * MESSAGE_CHARS.
  */
 function oneLine(text: string): string {
-  return text
+  return mask(text)
     .replaceAll(/[\u{0}-\u{1F}\u{7F}]+/gu, " ")
     .trim()
     .slice(0, MESSAGE_CHARS);
@@ -235,19 +238,10 @@ export function liveEvent(
 }
 
 /**
- * Первое распознанное событие alert-файла (JSONL от хуков харнессов);
+ * Первое распознанное событие в тексте alert-файла (JSONL от хуков);
  * битые строки и неизвестные типы пропускаются. Нет — undefined.
  */
-async function readAlert(
-  file: string | undefined,
-): Promise<HarnessEvent | undefined> {
-  if (file === undefined) return undefined;
-  let text: string;
-  try {
-    text = await readFile(file, "utf8");
-  } catch {
-    return undefined;
-  }
+function alertEvent(text: string): HarnessEvent | undefined {
   for (const line of text.split("\n")) {
     let value: unknown;
     try {
@@ -268,20 +262,47 @@ async function readAlert(
 }
 
 /**
- * Изменился ли размер файла с прошлой проверки (нет файла — нет).
+ * Размер файла (нет файла — 0).
  */
-async function hasGrown(
-  file: string | undefined,
-  sizes: Map<string, number>,
-): Promise<boolean> {
-  if (file === undefined) return false;
+async function sizeOf(file: string | undefined): Promise<number> {
+  if (file === undefined) return 0;
   try {
-    const { size } = await stat(file);
-    if (sizes.get(file) === size) return false;
-    sizes.set(file, size);
-    return true;
+    const info = await stat(file);
+    return info.size;
   } catch {
-    return false;
+    return 0;
+  }
+}
+
+/**
+ * Новое в файле с позиции `from` (размер до запуска: прошлый вывод `>>` не
+ * событие), не больше TAIL_BYTES с конца; обрезанное спереди окно теряет
+ * неполную первую строку. Файл стал короче (`>` перезаписал) — с начала.
+ * undefined — размер не менялся с прошлого чтения (`seen`).
+ */
+async function readNew(
+  file: string | undefined,
+  from: number,
+  seen: Map<string, number>,
+): Promise<string | undefined> {
+  if (file === undefined) return undefined;
+  try {
+    const handle = await open(file, "r");
+    try {
+      const { size } = await handle.stat();
+      if (seen.get(file) === size) return undefined;
+      seen.set(file, size);
+      const base = size < from ? 0 : from;
+      const start = Math.max(base, size - TAIL_BYTES);
+      const buffer = Buffer.alloc(size - start);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+      const text = buffer.subarray(0, bytesRead).toString("utf8");
+      return start > base ? text.slice(text.indexOf("\n") + 1) : text;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
   }
 }
 
@@ -795,6 +816,8 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     );
     return BUSY_CODE;
   }
+  const watchFrom = await sizeOf(arguments_.watchFile);
+  const alertFrom = await sizeOf(arguments_.alertFile);
   // stdin — /dev/null: неинтерактивному раннеру ввод не нужен, а `pi -p`
   // иначе молча висит на чтении stdin Bash-инструмента
   const child = spawn(binary, rest, {
@@ -819,22 +842,30 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   // продлевает жизнь не дольше окна тишины после него
   let lastHard = started;
   let tail = Buffer.alloc(0);
+  // для живых шаблонов у каждого потока свой хвост: иначе строка stderr
+  // теряет начало после stdout без перевода строки
+  const streamTails = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
   const forward =
-    (target: NodeJS.WriteStream, isStdout: boolean) => (chunk: Buffer) => {
+    (target: NodeJS.WriteStream, stream: "stdout" | "stderr") =>
+    (chunk: Buffer) => {
       lastSignal = Date.now();
       lastHard = lastSignal;
       tail = Buffer.concat([tail, chunk]).subarray(-TAIL_BYTES);
+      const own = Buffer.concat([streamTails[stream], chunk]).subarray(
+        -TAIL_BYTES,
+      );
+      streamTails[stream] = own;
       target.write(chunk);
-      if (isStdout)
+      if (stream === "stdout")
         state.isNewlineEnded = chunk.subarray(-1).toString() === "\n";
       state.event ??= liveEvent(
-        tail.toString("utf8"),
+        own.toString("utf8"),
         executor,
-        tail.length >= TAIL_BYTES,
+        own.length >= TAIL_BYTES,
       );
     };
-  child.stdout.on("data", forward(process.stdout, true));
-  child.stderr.on("data", forward(process.stderr, false));
+  child.stdout.on("data", forward(process.stdout, "stdout"));
+  child.stderr.on("data", forward(process.stderr, "stderr"));
   // Потребитель закрыл канал (`| head`): пишем уже некуда — гасим группу.
   const abandon = (): void => {
     state.isAbandoned = true;
@@ -898,21 +929,11 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       await releaseIfGone(lockFile, pgid);
       return 141;
     }
-    if (
-      state.event === undefined &&
-      (await hasGrown(arguments_.watchFile, sizes))
-    ) {
-      state.event = liveEvent(
-        await readFileTail(arguments_.watchFile),
-        executor,
-      );
-    }
-    if (
-      state.event === undefined &&
-      (await hasGrown(arguments_.alertFile, sizes))
-    ) {
-      state.event = await readAlert(arguments_.alertFile);
-    }
+    // ??= после await: событие из потока, пришедшее во время чтения, не теряется
+    const watched = await readNew(arguments_.watchFile, watchFrom, sizes);
+    if (watched !== undefined) state.event ??= liveEvent(watched, executor);
+    const alerted = await readNew(arguments_.alertFile, alertFrom, sizes);
+    if (alerted !== undefined) state.event ??= alertEvent(alerted);
     if (Date.now() - lastSample >= POLL_MS) {
       lastSample = Date.now();
       try {
@@ -990,12 +1011,22 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   const event =
     state.event ??
     liveEvent(
-      `${tail.toString("utf8")}\n`,
+      `${streamTails.stdout.toString("utf8")}\n`,
       executor,
-      tail.length >= TAIL_BYTES,
+      streamTails.stdout.length >= TAIL_BYTES,
     ) ??
-    liveEvent(`${fileTail}\n`, executor) ??
-    (await readAlert(arguments_.alertFile));
+    liveEvent(
+      `${streamTails.stderr.toString("utf8")}\n`,
+      executor,
+      streamTails.stderr.length >= TAIL_BYTES,
+    ) ??
+    liveEvent(
+      `${(await readNew(arguments_.watchFile, watchFrom, new Map())) ?? ""}\n`,
+      executor,
+    ) ??
+    alertEvent(
+      (await readNew(arguments_.alertFile, alertFrom, new Map())) ?? "",
+    );
   const reportLimit = async (epoch: number): Promise<number> => {
     if (executor !== undefined) {
       try {
