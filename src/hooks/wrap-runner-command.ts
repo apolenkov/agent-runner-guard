@@ -60,8 +60,10 @@ const PI_COMMAND =
  */
 function withPiExtension(command: string, extension: string): string {
   for (const match of command.matchAll(PI_COMMAND)) {
-    if (isQuotedAt(command, match.index)) continue;
     const [whole, prefix = "", directory = "", space = " "] = match;
+    // кавычки проверяются у самого токена pi: приставка `X="… pi -p` — текст
+    if (isQuotedAt(command, match.index + prefix.length + directory.length))
+      continue;
     const quoted = extension.replaceAll("'", String.raw`'\''`);
     return `${command.slice(0, match.index)}${prefix}${directory}pi -e '${quoted}'${space}-p${command.slice(match.index + whole.length)}`;
   }

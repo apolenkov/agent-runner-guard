@@ -86,3 +86,22 @@ void test("pi-alert: сбой записи не роняет Pi", () => {
     pi.emit("agent_before_settle", { outcome: "error" });
   });
 });
+
+void test("pi-alert: признак лимита после 2000 символов и длинный текст сохраняются целиком", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-alert-long-"));
+  try {
+    const file = path.join(directory, "a.jsonl");
+    const message = `${"x".repeat(3000)} 429 rate limit`;
+    const pi = fakePi();
+    piAlert(pi, file);
+    pi.emit("message_end", failed(message));
+    pi.emit("agent_before_settle", { outcome: "error" });
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), {
+      type: "rate_limit",
+      source: "pi",
+      message,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

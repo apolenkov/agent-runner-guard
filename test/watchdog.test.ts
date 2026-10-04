@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmod,
   mkdir,
@@ -1500,6 +1500,28 @@ void test("длинное событие alert-файла (> 64 КБ) не те�
     ]);
     assert.equal(result.code, 79, result.lastLine);
     assert.match(result.lastLine, /^FAILED boom x+$/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("--watch-file — FIFO: сторож не блокируется на открытии и запускает команду", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-fifo-"));
+  const fifo = path.join(directory, "pipe");
+  try {
+    spawnSync("mkfifo", [fifo]);
+    const result = await watchdog([
+      "--max-seconds",
+      "20",
+      "--watch-file",
+      fifo,
+      "--",
+      "sh",
+      "-c",
+      "echo started",
+    ]);
+    assert.equal(result.lastLine, "DONE 0", result.stdout);
+    assert.ok(result.seconds < 10);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -278,6 +278,9 @@ async function markOf(file: string | undefined): Promise<FileMark> {
   const empty = { size: 0, edge: Buffer.alloc(0) };
   if (file === undefined) return empty;
   try {
+    // FIFO и прочие нерегулярные файлы не открываем: open ждал бы писателя
+    const info = await stat(file);
+    if (!info.isFile()) return empty;
     const handle = await open(file, "r");
     try {
       const { size } = await handle.stat();
@@ -306,6 +309,8 @@ async function readNew(
 ): Promise<string | undefined> {
   if (file === undefined) return undefined;
   try {
+    const info = await stat(file);
+    if (!info.isFile()) return undefined; // FIFO: open ждал бы писателя
     const handle = await open(file, "r");
     try {
       const { size } = await handle.stat();
@@ -353,6 +358,8 @@ async function createAlertFile(): Promise<string> {
 async function readFileTail(file: string | undefined): Promise<string> {
   if (file === undefined) return "";
   try {
+    const info = await stat(file);
+    if (!info.isFile()) return ""; // FIFO: open ждал бы писателя
     return (await readTail(file, TAIL_BYTES)) ?? "";
   } catch {
     return "";

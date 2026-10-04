@@ -320,3 +320,8 @@ void test("нет файла расширения рядом со стороже
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+void test("pi -p внутри кавычек присваивания не трогается, инструментируется настоящий", () => {
+  const command = String(wrapped('NOTE="try pi -p hi"; pi -p hi'));
+  assert.ok(command.includes('NOTE="try pi -p hi"; pi -e'), command);
+});
