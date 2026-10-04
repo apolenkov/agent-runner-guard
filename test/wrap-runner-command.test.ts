@@ -331,6 +331,10 @@ void test("heredoc в команде — расширение не добавл�
   assert.doesNotMatch(String(wrapped(command)), /pi-alert/);
 });
 
-void test("<< внутри кавычек промпта — не heredoc, расширение добавляется", () => {
-  assert.match(String(wrapped("pi -p 'explain x << 2'")), /pi-alert/);
+void test("<< где угодно (даже в промпте) — консервативно без расширения", () => {
+  assert.doesNotMatch(String(wrapped("pi -p 'explain x << 2'")), /pi-alert/);
+  assert.doesNotMatch(
+    String(wrapped("# don't\ncat <<'EOF'\nHere's pi -p hi\nEOF\npi -p @p")),
+    /pi-alert/,
+  );
 });
