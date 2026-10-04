@@ -7,10 +7,14 @@
  * замок <executor-limits>/locks/<sha256 идентичности> — исполнитель +
  * prompt-файл, иначе исполнитель + реальный cwd + команда без редиректов; внутри — pgid
  * группы, pid сторожа и файл вывода; замок жив, пока жива группа или сторож.
+ * Живые события (лимит, отказ инструмента — по строкам вывода и
+ * `--watch-file`; события хуков харнессов — по alert-файлу, путь в env
+ * HARNESS_ALERT_FILE) останавливают группу сразу, не дожидаясь выхода.
  * Последняя строка stdout: DONE <код> | RATE_LIMIT <epoch> |
- * STALLED <silence|ceiling> | BUSY <pid> <файл вывода>.
- * Коды выхода: код команды (75, 76 и 77 → 1), 75 — лимит, 76 — зависание,
- * 77 — та же задача уже идёт.
+ * STALLED <silence|ceiling> | BUSY <pid> <файл вывода> | WAITING <что> |
+ * FAILED <почему>.
+ * Коды выхода: код команды (75–79 → 1), 75 — лимит, 76 — зависание,
+ * 77 — та же задача уже идёт, 78 — ждёт ввода/отказ, 79 — ошибка харнесса.
  */
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -44,6 +48,8 @@ const TAIL_BYTES = 64 * 1024;
 const POLL_MS = 2000;
 const TICK_MS = 200;
 const TERM_GRACE_MS = 5000;
+// по событию ждём меньше: итог — за ~5 с от события
+const EVENT_GRACE_MS = 2000;
 const DEFAULT_SILENCE = 600;
 const DEFAULT_RESET_SECONDS = 30 * 60;
 // Devin: «quota» бывает в обычном коде, поэтому ищем только его формулировку.
@@ -59,6 +65,41 @@ const LIMIT_PATTERN: Record<Executor, RegExp> = {
   pi: OTHER_LIMIT_PATTERN,
 };
 const BUSY_CODE = 77;
+const WAITING_CODE = 78;
+const FAILED_CODE = 79;
+const MESSAGE_CHARS = 120;
+
+const ALERT_TYPES = ["rate_limit", "waiting", "error"] as const;
+type AlertType = (typeof ALERT_TYPES)[number];
+
+function isAlertType(value: unknown): value is AlertType {
+  return (ALERT_TYPES as readonly unknown[]).includes(value);
+}
+
+interface HarnessEvent {
+  type: AlertType;
+  message: string;
+}
+
+// Живые шаблоны: с начала строки и полной формулировкой самого харнесса —
+// рабочий текст раннера (дифф, вывод cat) их не даёт. Pi сообщает о
+// событиях через расширение (alert-файл), своих шаблонов у него нет.
+const LIVE_PATTERNS: Partial<Record<Executor, [AlertType, RegExp][]>> = {
+  devin: [
+    ["rate_limit", /^(?:Error:\s*)?Reached free model rate limit/m],
+    [
+      "waiting",
+      /^warning: rejected a tool call that requires confirmation\. Running in non-interactive mode/m,
+    ],
+  ],
+  // ponytail: формат Codex не подтверждён живым лимитом (спайк S2 спеки)
+  codex: [
+    [
+      "rate_limit",
+      /^(?:\[[^\]\n]*\]\s*)?ERROR:?\s[^\n]*(?:hit your usage limit|usage_limit_reached)/im,
+    ],
+  ],
+};
 // Обёртки и приставки перед настоящей командой: env, VAR=1, timeout 600, …
 const PREFIX_TOKEN = /^(?:env|nohup|nice|exec|timeout|\w+=.*|-\S*|\d+[smhd]?)$/;
 
@@ -66,6 +107,7 @@ export interface WatchdogArguments {
   silence: number;
   maxSeconds: number | undefined;
   watchFile?: string;
+  alertFile?: string;
   command: string[];
 }
 
@@ -87,8 +129,8 @@ export function parseWatchdogArguments(argv: string[]): WatchdogArguments {
     const name = options[index];
     const value = options[index + 1];
     if (value === undefined) throw new Error(`у ${String(name)} нет значения`);
-    if (name === "--watch-file") {
-      result.watchFile = value;
+    if (name === "--watch-file" || name === "--alert-file") {
+      result[name === "--watch-file" ? "watchFile" : "alertFile"] = value;
     } else if (name === "--silence" || name === "--max-seconds") {
       const seconds = Number(value);
       if (!Number.isFinite(seconds) || seconds <= 0) {
@@ -155,6 +197,108 @@ export function findRateLimit(
     seconds = Number(reset[1]) * (/^h/i.test(reset[2] ?? "") ? 3600 : 60);
   }
   return Math.floor(nowMs / 1000) + seconds;
+}
+
+/**
+ * Одна строка для вердикта: без управляющих символов, не длиннее
+ * MESSAGE_CHARS.
+ */
+function oneLine(text: string): string {
+  return text
+    .replaceAll(/[\u{0}-\u{1F}\u{7F}]+/gu, " ")
+    .trim()
+    .slice(0, MESSAGE_CHARS);
+}
+
+/**
+ * Живое событие в выводе: только завершённые строки; у окна, обрезанного
+ * спереди, первая (неполная) строка отбрасывается. Нет — undefined.
+ */
+export function liveEvent(
+  text: string,
+  executor: Executor | undefined,
+  isTruncated = false,
+): HarnessEvent | undefined {
+  const end = text.lastIndexOf("\n");
+  if (executor === undefined || end === -1) return undefined;
+  const start = isTruncated ? text.indexOf("\n") + 1 : 0;
+  const complete = text.slice(start, end + 1);
+  const patterns = LIVE_PATTERNS[executor] ?? [];
+  for (const [type, pattern] of patterns) {
+    const match = pattern.exec(complete);
+    if (match !== null) {
+      const line = complete.slice(match.index).split("\n", 1)[0] ?? "";
+      return { type, message: oneLine(line) };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Первое распознанное событие alert-файла (JSONL от хуков харнессов);
+ * битые строки и неизвестные типы пропускаются. Нет — undefined.
+ */
+async function readAlert(
+  file: string | undefined,
+): Promise<HarnessEvent | undefined> {
+  if (file === undefined) return undefined;
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch {
+    return undefined;
+  }
+  for (const line of text.split("\n")) {
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof value !== "object" || value === null) continue;
+    const { type, message } = value as Record<string, unknown>;
+    if (isAlertType(type)) {
+      return {
+        type,
+        message: oneLine(typeof message === "string" ? message : type),
+      };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Изменился ли размер файла с прошлой проверки (нет файла — нет).
+ */
+async function hasGrown(
+  file: string | undefined,
+  sizes: Map<string, number>,
+): Promise<boolean> {
+  if (file === undefined) return false;
+  try {
+    const { size } = await stat(file);
+    if (sizes.get(file) === size) return false;
+    sizes.set(file, size);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Alert-файл по умолчанию: <executor-limits>/alerts/<pid>-<uuid>.jsonl,
+ * каталог 0700, пустой файл 0600. Удаляет вызывающий.
+ */
+async function createAlertFile(): Promise<string> {
+  const directory = path.join(limitsDirectory(), "alerts");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const file = path.join(
+    directory,
+    `${String(process.pid)}-${randomUUID()}.jsonl`,
+  );
+  await writeFile(file, "", { mode: 0o600, flag: "wx" });
+  return file;
 }
 
 /**
@@ -564,13 +708,13 @@ function isGroupAlive(pgid: number): boolean {
  * SIGTERM своей группе, до 5 с ожидания, затем SIGKILL ей же.
  * Сигналы только `-pgid` группы, созданной этим сторожем.
  */
-async function stopGroup(pgid: number): Promise<void> {
+async function stopGroup(pgid: number, graceMs = TERM_GRACE_MS): Promise<void> {
   try {
     process.kill(-pgid, "SIGTERM");
   } catch {
     return;
   }
-  const deadline = Date.now() + TERM_GRACE_MS;
+  const deadline = Date.now() + graceMs;
   while (isGroupAlive(pgid) && Date.now() < deadline) await sleep(100);
   if (!isGroupAlive(pgid)) return;
   try {
@@ -651,27 +795,43 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     );
     return BUSY_CODE;
   }
+  // stdin — /dev/null: неинтерактивному раннеру ввод не нужен, а `pi -p`
+  // иначе молча висит на чтении stdin Bash-инструмента
   const child = spawn(binary, rest, {
     detached: true,
-    stdio: ["inherit", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
+    env:
+      arguments_.alertFile === undefined
+        ? process.env
+        : { ...process.env, HARNESS_ALERT_FILE: arguments_.alertFile },
   });
   const pgid = child.pid;
   const state: {
-    stop?: "silence" | "ceiling";
+    stop?: "silence" | "ceiling" | "event";
+    event?: HarnessEvent | undefined;
     isFinished: boolean;
     isNewlineEnded: boolean;
     isAbandoned: boolean;
   } = { isFinished: false, isNewlineEnded: true, isAbandoned: false };
   const isDone = (): boolean => state.isFinished;
   let lastSignal = started;
+  // «жёсткий» признак жизни (вывод, файл, процессы, журнал): рост CPU
+  // продлевает жизнь не дольше окна тишины после него
+  let lastHard = started;
   let tail = Buffer.alloc(0);
   const forward =
     (target: NodeJS.WriteStream, isStdout: boolean) => (chunk: Buffer) => {
       lastSignal = Date.now();
+      lastHard = lastSignal;
       tail = Buffer.concat([tail, chunk]).subarray(-TAIL_BYTES);
       target.write(chunk);
       if (isStdout)
         state.isNewlineEnded = chunk.subarray(-1).toString() === "\n";
+      state.event ??= liveEvent(
+        tail.toString("utf8"),
+        executor,
+        tail.length >= TAIL_BYTES,
+      );
     };
   child.stdout.on("data", forward(process.stdout, true));
   child.stderr.on("data", forward(process.stderr, false));
@@ -723,6 +883,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   }
   let lastSample = Date.now();
   let stopText = "";
+  const sizes = new Map<string, number>();
   void exit.then(() => {
     state.isFinished = true;
   });
@@ -737,18 +898,40 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       await releaseIfGone(lockFile, pgid);
       return 141;
     }
+    if (
+      state.event === undefined &&
+      (await hasGrown(arguments_.watchFile, sizes))
+    ) {
+      state.event = liveEvent(
+        await readFileTail(arguments_.watchFile),
+        executor,
+      );
+    }
+    if (
+      state.event === undefined &&
+      (await hasGrown(arguments_.alertFile, sizes))
+    ) {
+      state.event = await readAlert(arguments_.alertFile);
+    }
     if (Date.now() - lastSample >= POLL_MS) {
       lastSample = Date.now();
       try {
         const sample = await sampleSignals(pgid, arguments_.watchFile);
+        const now = Date.now();
         if (
           previous !== undefined &&
-          (sample.cpu > previous.cpu ||
-            sample.children !== previous.children ||
+          (sample.children !== previous.children ||
             sample.log > previous.log ||
             sample.file > previous.file)
         ) {
-          lastSignal = Date.now();
+          lastSignal = now;
+          lastHard = now;
+        } else if (
+          previous !== undefined &&
+          sample.cpu > previous.cpu &&
+          now - lastHard <= arguments_.silence * 1000
+        ) {
+          lastSignal = now;
         }
         previous = sample;
       } catch {
@@ -756,7 +939,10 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       }
     }
     const now = Date.now();
-    if (
+    if (state.event !== undefined) {
+      state.stop = "event";
+      stopText = `событие: ${state.event.type}: ${state.event.message}`;
+    } else if (
       arguments_.maxSeconds !== undefined &&
       now - started > arguments_.maxSeconds * 1000
     ) {
@@ -768,9 +954,16 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     }
     if (state.stop !== undefined) {
       if (!state.isNewlineEnded) process.stdout.write("\n");
-      process.stdout.write(`WATCHDOG: остановлен: ${stopText}\n`);
+      process.stdout.write(
+        state.stop === "event"
+          ? `WATCHDOG: ${stopText}\n`
+          : `WATCHDOG: остановлен: ${stopText}\n`,
+      );
       state.isNewlineEnded = true;
-      await stopGroup(pgid);
+      await stopGroup(
+        pgid,
+        state.stop === "event" ? EVENT_GRACE_MS : TERM_GRACE_MS,
+      );
       break;
     }
   }
@@ -793,6 +986,44 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   // вывод исполнителя мог уйти в файл (`> run.out; echo exit=$? >> run.out`):
   // тогда хвост и настоящий код выхода берутся из него
   const fileTail = await readFileTail(arguments_.watchFile);
+  // финальная проверка: событие могло прийти перед самым выходом
+  const event =
+    state.event ??
+    liveEvent(
+      `${tail.toString("utf8")}\n`,
+      executor,
+      tail.length >= TAIL_BYTES,
+    ) ??
+    liveEvent(`${fileTail}\n`, executor) ??
+    (await readAlert(arguments_.alertFile));
+  const reportLimit = async (epoch: number): Promise<number> => {
+    if (executor !== undefined) {
+      try {
+        await writeLimitFile(limitsDirectory(), executor, epoch);
+      } catch (error) {
+        process.stderr.write(
+          `WATCHDOG: файл ограничений не записан: ${String(error)}\n`,
+        );
+      }
+    }
+    process.stdout.write(`RATE_LIMIT ${String(epoch)}\n`);
+    await releaseIfGone(lockFile, pgid);
+    return 75;
+  };
+  if (event?.type === "rate_limit") {
+    return reportLimit(
+      findRateLimit(event.message, executor, Date.now()) ??
+        Math.floor(Date.now() / 1000) + DEFAULT_RESET_SECONDS,
+    );
+  }
+  if (event !== undefined) {
+    const isWaiting = event.type === "waiting";
+    process.stdout.write(
+      `${isWaiting ? "WAITING" : "FAILED"} ${event.message}\n`,
+    );
+    await releaseIfGone(lockFile, pgid);
+    return isWaiting ? WAITING_CODE : FAILED_CODE;
+  }
   const fileCode = /(?:^|\n)exit=(\d+)\s*$/.exec(fileTail)?.[1];
   const hasFailed =
     result.code !== 0 || (fileCode !== undefined && fileCode !== "0");
@@ -802,20 +1033,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       executor,
       Date.now(),
     );
-    if (epoch !== undefined) {
-      if (executor !== undefined) {
-        try {
-          await writeLimitFile(limitsDirectory(), executor, epoch);
-        } catch (error) {
-          process.stderr.write(
-            `WATCHDOG: файл ограничений не записан: ${String(error)}\n`,
-          );
-        }
-      }
-      process.stdout.write(`RATE_LIMIT ${String(epoch)}\n`);
-      await releaseIfGone(lockFile, pgid);
-      return 75;
-    }
+    if (epoch !== undefined) return reportLimit(epoch);
   }
   if (state.stop !== undefined) {
     process.stdout.write(`STALLED ${state.stop}\n`);
@@ -824,18 +1042,42 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   }
   process.stdout.write(`DONE ${String(result.code)}\n`);
   await releaseLock(lockFile);
-  return [75, 76, BUSY_CODE].includes(result.code) ? 1 : result.code;
+  return [75, 76, BUSY_CODE, WAITING_CODE, FAILED_CODE].includes(result.code)
+    ? 1
+    : result.code;
 }
 
 if (import.meta.main) {
+  let ownAlertFile: string | undefined;
   try {
-    process.exitCode = await runWatchdog(
-      parseWatchdogArguments(process.argv.slice(2)),
-    );
+    const arguments_ = parseWatchdogArguments(process.argv.slice(2));
+    if (arguments_.alertFile === undefined) {
+      try {
+        ownAlertFile = await createAlertFile();
+        arguments_.alertFile = ownAlertFile;
+      } catch (error) {
+        process.stderr.write(
+          `WATCHDOG: alert-файл не создан: ${String(error)}\n`,
+        );
+      }
+    }
+    process.exitCode = await runWatchdog(arguments_);
   } catch (error) {
     process.stderr.write(
       `watchdog: ${error instanceof Error ? error.message : String(error)}\n`,
     );
     process.exitCode = 2;
+  } finally {
+    if (ownAlertFile !== undefined) {
+      await rm(ownAlertFile, { force: true });
+      // как у замков: только пустые каталоги и не выше базы
+      for (const directory of [path.dirname(ownAlertFile), limitsDirectory()]) {
+        try {
+          await rmdir(directory);
+        } catch {
+          break; // чужие файлы идущих запусков
+        }
+      }
+    }
   }
 }

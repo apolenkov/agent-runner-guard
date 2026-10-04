@@ -21,6 +21,7 @@ import {
   acquireLock,
   detectExecutor,
   findRateLimit,
+  liveEvent,
   parseWatchdogArguments,
   runLockFile,
   writeLimitFile,
@@ -287,10 +288,10 @@ void test("потребитель закрыл канал (EPIPE) → групп
   }
 });
 
-void test("тишина вывода не зависание: растущее процессорное время → ceiling", async () => {
+void test("тишина вывода не зависание: растущее процессорное время в пределах окна тишины → ceiling", async () => {
   const result = await watchdog([
     "--silence",
-    "2",
+    "4",
     "--max-seconds",
     "6",
     "--",
@@ -1053,6 +1054,10 @@ void test("parseWatchdogArguments: опции до --, команда после
     maxSeconds: undefined,
     command: ["x"],
   });
+  assert.equal(
+    parseWatchdogArguments(["--alert-file", "/t/a.jsonl", "--", "x"]).alertFile,
+    "/t/a.jsonl",
+  );
   assert.throws(() => parseWatchdogArguments(["--silence", "5"]));
   assert.throws(() => parseWatchdogArguments(["--silence", "abc", "--", "x"]));
 });
@@ -1141,4 +1146,237 @@ void test("вывод в файл, exit=0 и слово «rate limit» в тек
   } finally {
     await rm(limitHome, { recursive: true, force: true });
   }
+});
+
+// Живые события (TASK-271): сторож завершает запуск за секунды, не дожидаясь выхода.
+
+void test("живой лимит: devin печатает строку лимита и жжёт CPU → RATE_LIMIT < 5 с", async () => {
+  const before = Math.floor(Date.now() / 1000);
+  const limitHome = await mkdtemp(path.join(tmpdir(), "watchdog-live-limit-"));
+  try {
+    const result = await watchdog(
+      [
+        "--max-seconds",
+        "30",
+        "--",
+        path.join(bin, "devin"),
+        "-p",
+        "-c",
+        `echo '${LIMIT_TEXT}'; while :; do :; done`,
+      ],
+      limitHome,
+    );
+    assert.equal(result.code, 75, result.stdout);
+    assert.ok(result.seconds < 5, `заняло ${String(result.seconds)} с`);
+    const epoch = Number(/^RATE_LIMIT (\d+)$/.exec(result.lastLine)?.[1]);
+    assert.ok(Math.abs(epoch - (before + 180)) <= 10, result.lastLine);
+    assert.match(result.stdout, /WATCHDOG: событие: rate_limit/);
+    const file = path.join(
+      limitHome,
+      ".local",
+      "state",
+      "executor-limits",
+      "devin",
+    );
+    assert.equal(await readFile(file, "utf8"), `${String(epoch)}\n`);
+  } finally {
+    await rm(limitHome, { recursive: true, force: true });
+  }
+});
+
+void test("живой лимит в --watch-file (вывод раннера в файл) → RATE_LIMIT < 5 с", async () => {
+  const limitHome = await mkdtemp(path.join(tmpdir(), "watchdog-live-file-"));
+  const out = path.join(limitHome, "run.out");
+  try {
+    const result = await watchdog(
+      [
+        "--max-seconds",
+        "30",
+        "--watch-file",
+        out,
+        "--",
+        "bash",
+        "-c",
+        `${path.join(bin, "devin")} -p -c "echo '${LIMIT_TEXT}'; while :; do :; done" > ${out} 2>&1`,
+      ],
+      limitHome,
+    );
+    assert.equal(result.code, 75, result.stdout);
+    assert.ok(result.seconds < 5, `заняло ${String(result.seconds)} с`);
+    assert.match(result.lastLine, /^RATE_LIMIT \d+$/);
+  } finally {
+    await rm(limitHome, { recursive: true, force: true });
+  }
+});
+
+const DEVIN_REJECTED =
+  "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools.";
+
+void test("devin отклонил инструмент и вышел с 0 → WAITING, код 78", async () => {
+  const result = await watchdog([
+    "--",
+    path.join(bin, "devin"),
+    "-p",
+    "-c",
+    `echo '${DEVIN_REJECTED}'; exit 0`,
+  ]);
+  assert.equal(result.code, 78, result.stdout);
+  assert.match(result.lastLine, /^WAITING .*rejected a tool call/);
+});
+
+void test("devin отклонил инструмент и продолжает работать → WAITING < 5 с", async () => {
+  const result = await watchdog([
+    "--max-seconds",
+    "30",
+    "--",
+    path.join(bin, "devin"),
+    "-p",
+    "-c",
+    `echo '${DEVIN_REJECTED}'; sleep 60`,
+  ]);
+  assert.equal(result.code, 78, result.stdout);
+  assert.ok(result.seconds < 5, `заняло ${String(result.seconds)} с`);
+});
+
+void test("не событие: строка лимита с отступом или в кавычках (cat исходника) при коде 0 → DONE 0", async () => {
+  const other = await mkdtemp(path.join(tmpdir(), "watchdog-live-fp-"));
+  try {
+    const result = await watchdog(
+      [
+        "--",
+        path.join(bin, "devin"),
+        "-p",
+        "-c",
+        `echo '  "${LIMIT_TEXT}"'; echo '"${DEVIN_REJECTED}"'; sleep 1; exit 0`,
+      ],
+      other,
+    );
+    assert.equal(result.lastLine, "DONE 0", result.stdout);
+    assert.equal(result.code, 0);
+  } finally {
+    await rm(other, { recursive: true, force: true });
+  }
+});
+
+void test("alert-файл: хук пишет waiting/error/rate_limit → WAITING 78 / FAILED 79 / RATE_LIMIT 75 за < 5 с", async () => {
+  const cases: [string, number, RegExp][] = [
+    ["waiting", 78, /^WAITING exec: rm -rf x$/],
+    ["error", 79, /^FAILED exec: rm -rf x$/],
+    ["rate_limit", 75, /^RATE_LIMIT \d+$/],
+  ];
+  for (const [type, code, line] of cases) {
+    const other = await mkdtemp(path.join(tmpdir(), "watchdog-alert-"));
+    try {
+      const event = JSON.stringify({
+        type,
+        source: "pi",
+        message: "exec: rm -rf x",
+      });
+      const result = await watchdog(
+        [
+          "--max-seconds",
+          "30",
+          "--",
+          path.join(bin, "pi"),
+          "-c",
+          `echo 'not json' >> "$HARNESS_ALERT_FILE"; echo '${event}' >> "$HARNESS_ALERT_FILE"; sleep 60`,
+        ],
+        other,
+      );
+      assert.equal(result.code, code, `${type}: ${result.stdout}`);
+      assert.match(result.lastLine, line);
+      assert.ok(result.seconds < 5, `заняло ${String(result.seconds)} с`);
+      // файл по умолчанию — в каталоге ограничений и удалён по завершении
+      const alerts = path.join(
+        other,
+        ".local",
+        "state",
+        "executor-limits",
+        "alerts",
+      );
+      await assert.rejects(stat(alerts));
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
+  }
+});
+
+void test("alert-файл: событие записано перед выходом с кодом 0 → вердикт события, явный --alert-file не удаляется", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-alert-exit-"));
+  const alert = path.join(directory, "alert.jsonl");
+  try {
+    const event = JSON.stringify({ type: "waiting", message: "confirm" });
+    const result = await watchdog([
+      "--alert-file",
+      alert,
+      "--",
+      "sh",
+      "-c",
+      `test "$HARNESS_ALERT_FILE" = '${alert}' && echo '${event}' >> "$HARNESS_ALERT_FILE"; exit 0`,
+    ]);
+    assert.equal(result.code, 78, result.stdout);
+    assert.equal(result.lastLine, "WAITING confirm");
+    assert.match(await readFile(alert, "utf8"), /confirm/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("ожидание ввода со стандартного ввода не вешает запуск: stdin ребёнка — /dev/null", async () => {
+  const child = spawn(
+    process.execPath,
+    [WATCHDOG, "--max-seconds", "20", "--", "sh", "-c", "read x; echo got=$?"],
+    { env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  let stdout = "";
+  child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+  const started = Date.now();
+  await new Promise<void>((resolve) => {
+    child.on("close", () => {
+      resolve();
+    });
+  });
+  child.stdin.destroy();
+  assert.ok(Date.now() - started < 5000, stdout);
+  assert.match(stdout, /got=1/);
+});
+
+void test("CPU без вывода дольше окна тишины — не жизнь → STALLED silence раньше потолка", async () => {
+  const result = await watchdog([
+    "--silence",
+    "2",
+    "--max-seconds",
+    "20",
+    "--",
+    process.execPath,
+    "-e",
+    "for(;;){}",
+  ]);
+  assert.equal(result.code, 76);
+  assert.equal(result.lastLine, "STALLED silence");
+  assert.ok(result.seconds < 12, `заняло ${String(result.seconds)} с`);
+});
+
+void test("liveEvent: только завершённые строки, обрезанная первая строка окна отброшена", () => {
+  const line = "Reached free model rate limit. Reset in 2 minutes.";
+  assert.deepEqual(liveEvent(`${line}\n`, "devin"), {
+    type: "rate_limit",
+    message: line,
+  });
+  assert.equal(liveEvent(line, "devin"), undefined); // строка ещё пишется
+  assert.equal(liveEvent(`${line}\nok\n`, "devin", true), undefined);
+  assert.equal(liveEvent(`x\n${line}\n`, "devin", true)?.type, "rate_limit");
+  assert.equal(liveEvent(`${line}\n`, "pi"), undefined); // у Pi — расширение
+  assert.equal(liveEvent(`${line}\n`, undefined), undefined);
+  assert.equal(
+    liveEvent(
+      "[2026-10-04T10:00:00] ERROR: You've hit your usage limit.\n",
+      "codex",
+    )?.type,
+    "rate_limit",
+  );
+  assert.equal(
+    liveEvent("  /you've hit your usage limit|usage_limit_reached/\n", "codex"),
+    undefined,
+  );
 });
