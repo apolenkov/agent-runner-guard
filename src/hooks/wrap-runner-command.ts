@@ -47,18 +47,23 @@ export function outputFileOf(
   return path.join(cwd, directory ?? "", target);
 }
 
+// `pi -p` в позиции команды: после начала строки или `;`, `&`, `|`, `(`,
+// через приставки (`env X=1`, `exec`, `timeout 600`, …) и с путём к файлу.
+const PI_COMMAND =
+  /(?<=(?:^|[;&|(\n])\s*)((?:(?:env|exec|nohup|nice|timeout|\w+=\S*|-\S+|\d+[smhd]?)\s+)*)(\S*\/)?pi(\s+)-p(?!\w)/g;
+
 /**
  * Добавляет `-e <расширение>` к первому `pi -p` в позиции команды (начало
- * строки или после `;`, `&`, `|`, `(`) и вне кавычек: текст промпта и
+ * строки или после `;`, `&`, `|`, `(`, в том числе за приставками и с
+ * путём) и вне кавычек: текст промпта и
  * `echo 'pi -p'` не трогаются. Подходящего нет — строка как есть.
  */
 function withPiExtension(command: string, extension: string): string {
-  for (const match of command.matchAll(
-    /(?<=(?:^|[;&|(\n])\s*)pi(\s+)-p(?!\w)/g,
-  )) {
+  for (const match of command.matchAll(PI_COMMAND)) {
     if (isQuotedAt(command, match.index)) continue;
+    const [whole, prefix = "", directory = "", space = " "] = match;
     const quoted = extension.replaceAll("'", String.raw`'\''`);
-    return `${command.slice(0, match.index)}pi -e '${quoted}'${match[1] ?? " "}-p${command.slice(match.index + match[0].length)}`;
+    return `${command.slice(0, match.index)}${prefix}${directory}pi -e '${quoted}'${space}-p${command.slice(match.index + whole.length)}`;
   }
   return command;
 }

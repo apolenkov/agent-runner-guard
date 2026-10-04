@@ -1461,3 +1461,46 @@ void test("сообщение события маскируется (ключи 
   assert.equal(result.code, 79, result.stdout);
   assert.doesNotMatch(result.stdout, new RegExp(secret));
 });
+
+void test("существующий файл перезаписан (>) — событие в начале нового содержимого видно → WAITING", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-overwrite-"));
+  const out = path.join(directory, "run.out");
+  try {
+    await writeFile(out, "old\n");
+    const result = await watchdog(
+      [
+        "--watch-file",
+        out,
+        "--",
+        "bash",
+        "-c",
+        `${path.join(bin, "devin")} -p -c "echo '${DEVIN_REJECTED}'" > ${out} 2>&1`,
+      ],
+      directory,
+    );
+    assert.equal(result.code, 78, result.stdout);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("длинное событие alert-файла (> 64 КБ) не теряется → FAILED", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-long-alert-"));
+  const event = path.join(directory, "event.json");
+  try {
+    await writeFile(
+      event,
+      `${JSON.stringify({ type: "error", message: `boom ${"x".repeat(70_000)}` })}\n`,
+    );
+    const result = await watchdog([
+      "--",
+      "sh",
+      "-c",
+      `cat '${event}' >> "$HARNESS_ALERT_FILE"`,
+    ]);
+    assert.equal(result.code, 79, result.lastLine);
+    assert.match(result.lastLine, /^FAILED boom x+$/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

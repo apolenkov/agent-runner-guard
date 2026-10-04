@@ -25,7 +25,8 @@ export default function piAlert(
       message?: { role?: string; stopReason?: string; errorMessage?: string };
     };
     if (message?.role === "assistant" && message.stopReason === "error") {
-      lastError = message.errorMessage ?? "error";
+      // сторож показывает 120 символов; длинные тела ответов не тащим
+      lastError = (message.errorMessage ?? "error").slice(0, 2000);
     }
   });
   pi.on("agent_before_settle", (event) => {

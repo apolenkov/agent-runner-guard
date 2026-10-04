@@ -261,29 +261,48 @@ function alertEvent(text: string): HarnessEvent | undefined {
   return undefined;
 }
 
+interface FileMark {
+  size: number;
+  edge: Buffer;
+}
+
+const EDGE_BYTES = 64;
+// alert-файл читается целиком (JSON-строку нельзя резать), но с потолком
+const ALERT_BYTES = 1024 * 1024;
+
 /**
- * Размер файла (нет файла — 0).
+ * Отметка файла до запуска: размер и последние байты перед ним — по ним
+ * дописывание (`>>`) отличается от перезаписи (`>`). Нет файла — пусто.
  */
-async function sizeOf(file: string | undefined): Promise<number> {
-  if (file === undefined) return 0;
+async function markOf(file: string | undefined): Promise<FileMark> {
+  const empty = { size: 0, edge: Buffer.alloc(0) };
+  if (file === undefined) return empty;
   try {
-    const info = await stat(file);
-    return info.size;
+    const handle = await open(file, "r");
+    try {
+      const { size } = await handle.stat();
+      const edge = Buffer.alloc(Math.min(EDGE_BYTES, size));
+      await handle.read(edge, 0, edge.length, size - edge.length);
+      return { size, edge };
+    } finally {
+      await handle.close();
+    }
   } catch {
-    return 0;
+    return empty;
   }
 }
 
 /**
- * Новое в файле с позиции `from` (размер до запуска: прошлый вывод `>>` не
- * событие), не больше TAIL_BYTES с конца; обрезанное спереди окно теряет
- * неполную первую строку. Файл стал короче (`>` перезаписал) — с начала.
- * undefined — размер не менялся с прошлого чтения (`seen`).
+ * Новое в файле после отметки до запуска (прошлый вывод `>>` не событие;
+ * файл перезаписан — с начала), не больше `limit` байт с конца; обрезанное
+ * спереди окно теряет неполную первую строку. undefined — размер не
+ * менялся с прошлого чтения (`seen`).
  */
 async function readNew(
   file: string | undefined,
-  from: number,
+  mark: FileMark,
   seen: Map<string, number>,
+  limit = TAIL_BYTES,
 ): Promise<string | undefined> {
   if (file === undefined) return undefined;
   try {
@@ -292,8 +311,13 @@ async function readNew(
       const { size } = await handle.stat();
       if (seen.get(file) === size) return undefined;
       seen.set(file, size);
-      const base = size < from ? 0 : from;
-      const start = Math.max(base, size - TAIL_BYTES);
+      let base = 0;
+      if (size >= mark.size) {
+        const edge = Buffer.alloc(mark.edge.length);
+        await handle.read(edge, 0, edge.length, mark.size - edge.length);
+        if (edge.equals(mark.edge)) base = mark.size;
+      }
+      const start = Math.max(base, size - limit);
       const buffer = Buffer.alloc(size - start);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
       const text = buffer.subarray(0, bytesRead).toString("utf8");
@@ -816,8 +840,8 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     );
     return BUSY_CODE;
   }
-  const watchFrom = await sizeOf(arguments_.watchFile);
-  const alertFrom = await sizeOf(arguments_.alertFile);
+  const watchFrom = await markOf(arguments_.watchFile);
+  const alertFrom = await markOf(arguments_.alertFile);
   // stdin — /dev/null: неинтерактивному раннеру ввод не нужен, а `pi -p`
   // иначе молча висит на чтении stdin Bash-инструмента
   const child = spawn(binary, rest, {
@@ -932,7 +956,12 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     // ??= после await: событие из потока, пришедшее во время чтения, не теряется
     const watched = await readNew(arguments_.watchFile, watchFrom, sizes);
     if (watched !== undefined) state.event ??= liveEvent(watched, executor);
-    const alerted = await readNew(arguments_.alertFile, alertFrom, sizes);
+    const alerted = await readNew(
+      arguments_.alertFile,
+      alertFrom,
+      sizes,
+      ALERT_BYTES,
+    );
     if (alerted !== undefined) state.event ??= alertEvent(alerted);
     if (Date.now() - lastSample >= POLL_MS) {
       lastSample = Date.now();
@@ -1025,7 +1054,12 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       executor,
     ) ??
     alertEvent(
-      (await readNew(arguments_.alertFile, alertFrom, new Map())) ?? "",
+      (await readNew(
+        arguments_.alertFile,
+        alertFrom,
+        new Map(),
+        ALERT_BYTES,
+      )) ?? "",
     );
   const reportLimit = async (epoch: number): Promise<number> => {
     if (executor !== undefined) {

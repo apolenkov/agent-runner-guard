@@ -291,6 +291,18 @@ void test("pi -p получает расширение pi-alert (-e), devin и c
       String.raw` -- bash -c 'echo '\''pi -p'\''; pi -e '\''${PI_ALERT}'\'' -p hi'`,
     ),
   );
+  for (const prefixed of [
+    "env X=1 pi -p hi",
+    "exec pi -p hi",
+    "timeout 600 pi -p hi",
+    "/usr/local/bin/pi -p hi",
+  ]) {
+    assert.match(
+      String(wrapped(prefixed)),
+      /pi -e '\\''[^']*pi-alert\.ts'\\'' -p hi'$/,
+      prefixed,
+    );
+  }
   assert.doesNotMatch(String(wrapped("devin -p x")), /pi-alert/);
   assert.doesNotMatch(String(wrapped("codex exec x")), /pi-alert/);
 });
