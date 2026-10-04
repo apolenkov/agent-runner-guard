@@ -325,3 +325,8 @@ void test("pi -p внутри кавычек присваивания не тр�
   const command = String(wrapped('NOTE="try pi -p hi"; pi -p hi'));
   assert.ok(command.includes('NOTE="try pi -p hi"; pi -e'), command);
 });
+
+void test("heredoc в команде — расширение не добавляется (тело heredoc не трогаем)", () => {
+  const command = "cat > p.txt <<'EOF'\npi -p hi\nEOF\npi -p @p.txt";
+  assert.doesNotMatch(String(wrapped(command)), /pi-alert/);
+});

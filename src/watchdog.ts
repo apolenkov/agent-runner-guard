@@ -231,7 +231,7 @@ export function liveEvent(
     const match = pattern.exec(complete);
     if (match !== null) {
       const line = complete.slice(match.index).split("\n", 1)[0] ?? "";
-      return { type, message: oneLine(line) };
+      return { type, message: line };
     }
   }
   return undefined;
@@ -254,7 +254,7 @@ function alertEvent(text: string): HarnessEvent | undefined {
     if (isAlertType(type)) {
       return {
         type,
-        message: oneLine(typeof message === "string" ? message : type),
+        message: typeof message === "string" ? message : type,
       };
     }
   }
@@ -540,6 +540,24 @@ async function readLock(file: string): Promise<LockContent | undefined> {
     pid: lockNumber(pidText),
     output: rest.join("\n").trim() || "-",
   };
+}
+
+/**
+ * Дописывает ли команда в файл: по первому редиректу (`>`/`>>`), цель
+ * которого совпадает с файлом по имени. Редиректа нет — undefined.
+ */
+function appendsTo(
+  command: string[],
+  file: string | undefined,
+): boolean | undefined {
+  if (file === undefined) return undefined;
+  for (const match of command
+    .join(" ")
+    .matchAll(/(?<![0-9>&])(>>?)[ \t]*("[^"]*"|'[^']*'|[^\s;|>&"']+)/g)) {
+    const target = (match[2] ?? "").replace(/^(['"])([\s\S]*)\1$/, "$2");
+    if (path.basename(target) === path.basename(file)) return match[1] === ">>";
+  }
+  return undefined;
 }
 
 /**
@@ -847,7 +865,13 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     );
     return BUSY_CODE;
   }
-  const watchFrom = await markOf(arguments_.watchFile);
+  // файл вывода: первый редирект `>` перезаписывает — читать с начала;
+  // `>>` — только дописанное; неизвестно — по отметке (размер и края)
+  const append = appendsTo(arguments_.command, arguments_.watchFile);
+  const watchFrom =
+    append === false
+      ? { size: 0, edge: Buffer.alloc(0) }
+      : await markOf(arguments_.watchFile);
   const alertFrom = await markOf(arguments_.alertFile);
   // stdin — /dev/null: неинтерактивному раннеру ввод не нужен, а `pi -p`
   // иначе молча висит на чтении stdin Bash-инструмента
@@ -998,7 +1022,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
     const now = Date.now();
     if (state.event !== undefined) {
       state.stop = "event";
-      stopText = `событие: ${state.event.type}: ${state.event.message}`;
+      stopText = `событие: ${state.event.type}: ${oneLine(state.event.message)}`;
     } else if (
       arguments_.maxSeconds !== undefined &&
       now - started > arguments_.maxSeconds * 1000
@@ -1091,7 +1115,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   if (event !== undefined) {
     const isWaiting = event.type === "waiting";
     process.stdout.write(
-      `${isWaiting ? "WAITING" : "FAILED"} ${event.message}\n`,
+      `${isWaiting ? "WAITING" : "FAILED"} ${oneLine(event.message)}\n`,
     );
     await releaseIfGone(lockFile, pgid);
     return isWaiting ? WAITING_CODE : FAILED_CODE;

@@ -1526,3 +1526,50 @@ void test("--watch-file — FIFO: сторож не блокируется на 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+void test("повторный запуск перезаписывает (>) файл тем же отказом → снова WAITING", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-same-"));
+  const out = path.join(directory, "run.out");
+  try {
+    for (let run = 0; run < 2; run += 1) {
+      const result = await watchdog(
+        [
+          "--watch-file",
+          out,
+          "--",
+          "bash",
+          "-c",
+          `${path.join(bin, "devin")} -p -c "echo '${DEVIN_REJECTED}'" > ${out} 2>&1; echo "exit=$?" >> ${out}`,
+        ],
+        directory,
+      );
+      assert.equal(result.code, 78, `запуск ${String(run)}: ${result.stdout}`);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("живой лимит: «reset in» дальше 120 символов строки всё равно задаёт сброс", async () => {
+  const before = Math.floor(Date.now() / 1000);
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-reset-"));
+  try {
+    const line = `Reached free model rate limit. ${"padding ".repeat(20)}Your limit will reset in 3 minutes.`;
+    const result = await watchdog(
+      [
+        "--max-seconds",
+        "30",
+        "--",
+        path.join(bin, "devin"),
+        "-p",
+        "-c",
+        `echo '${line}'; sleep 60`,
+      ],
+      directory,
+    );
+    const epoch = Number(/^RATE_LIMIT (\d+)$/.exec(result.lastLine)?.[1]);
+    assert.ok(Math.abs(epoch - (before + 180)) <= 10, result.lastLine);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

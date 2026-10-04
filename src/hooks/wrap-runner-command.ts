@@ -121,9 +121,11 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
       "harness",
       "pi-alert.ts",
     );
-    const runner = existsSync(extension)
-      ? withPiExtension(command, extension)
-      : command;
+    // heredoc (`<<`) не разбираем: его тело не трогаем, расширения не будет
+    const runner =
+      existsSync(extension) && !command.includes("<<")
+        ? withPiExtension(command, extension)
+        : command;
     const quoted = runner.replaceAll("'", String.raw`'\''`);
     // вывод уходит в файл — сторож смотрит в него: рост — жизнь, хвост — лимит
     const outputFile = outputFileOf(
