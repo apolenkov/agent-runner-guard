@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+
 import { mask } from "../src/mask.ts";
 
 void test("маскирует ключ sk-…", () => {

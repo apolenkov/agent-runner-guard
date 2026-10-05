@@ -39,27 +39,3 @@ export async function readTail(
     await handle.close();
   }
 }
-
-/**
- * Читает первые `maxBytes` файла; файла нет → undefined. Последняя строка
- * может быть оборвана — разбирающий код пропускает битые строки.
- */
-export async function readHead(
-  path: string,
-  maxBytes = 65_536,
-): Promise<string | undefined> {
-  let handle;
-  try {
-    handle = await open(path, "r");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
-  try {
-    const buffer = Buffer.alloc(maxBytes);
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
-    return buffer.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await handle.close();
-  }
-}

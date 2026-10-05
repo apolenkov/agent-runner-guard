@@ -3,6 +3,7 @@ import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+
 import { readTail } from "../src/tail.ts";
 
 async function withTemporaryDirectory(

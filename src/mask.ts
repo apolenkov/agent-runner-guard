@@ -30,12 +30,12 @@ export function mask(text: string): string {
     .replaceAll(/\bgh[opusr]_\w{16,}/g, "gh***")
     .replaceAll(/\bxox[abeprs]-[\w-]{8,}/g, "xox***")
     .replaceAll(/\bAKIA[A-Z0-9]{16}\b/g, "AKIA***")
-    .replaceAll(/\bsk-(ant-)?[\w-]{4,}/g, (m, ant: string | undefined) =>
+    .replaceAll(/\bsk-(ant-)?[\w-]{4,}/g, (_m, ant: string | undefined) =>
       ant === undefined ? "sk-***" : "sk-ant-***",
     )
     .replaceAll(
       /\b(Bearer|Basic)[ \t]+\S+/gi,
-      (m, scheme: string) => `${scheme} ***`,
+      (_m, scheme: string) => `${scheme} ***`,
     )
     .replaceAll(/\S*credentials\.toml\b/g, "<credentials>");
 }
