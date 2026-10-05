@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="agent-runner-guard: One verdict line for every headless agent run.">
+  <title>agent-runner-guard: One verdict line for every headless agent run.</title>
+  <rect x="1" y="1" width="1278" height="318" rx="18" fill="#0F1626" stroke="#26324A" stroke-width="2"/>
+  <g transform="translate(0,0)">
+  <path d="M168 94 L222 114 V168 C222 200 198 224 168 238 C138 224 114 200 114 168 V114 Z" fill="none" stroke="#26324A" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M138 168 H156 L164 148 L176 192 L184 168 H198" fill="none" stroke="#F5B451" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="290" y="148" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="62" font-weight="700" letter-spacing="-1.2" fill="#EDF1F7">agent-runner-guard</text>
+  <text x="292" y="196" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="25" fill="#A3AEC0">One verdict line for every headless agent run.</text>
+  <line x1="292" y1="230" x2="1216" y2="230" stroke="#26324A" stroke-width="1.5"/>
+  <text x="292" y="266" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="18" xml:space="preserve"><tspan fill="#7C889C">agent-runner-guard: </tspan><tspan fill="#F5B451">STALLED silence</tspan><tspan fill="#A3AEC0"> · codex · exit 76</tspan></text>
+</g>
+</svg>
