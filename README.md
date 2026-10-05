@@ -1,4 +1,7 @@
-# agent-runner-guard
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.svg">
+  <img alt="agent-runner-guard: one verdict line for every headless agent run" src=".github/assets/banner-light.svg" width="100%">
+</picture>
 
 ![Four runs under the guard: DONE, RATE_LIMIT, WAITING and FAILED verdicts](demo/demo.gif)
 
