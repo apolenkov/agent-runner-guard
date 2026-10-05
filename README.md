@@ -3,6 +3,11 @@
   <img alt="agent-runner-guard: one verdict line for every headless agent run" src=".github/assets/banner-light.svg" width="100%">
 </picture>
 
+[![ci](https://github.com/apolenkov/agent-runner-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/apolenkov/agent-runner-guard/actions/workflows/ci.yml)
+[![codeql](https://github.com/apolenkov/agent-runner-guard/actions/workflows/codeql.yml/badge.svg)](https://github.com/apolenkov/agent-runner-guard/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/apolenkov/agent-runner-guard/badge)](https://scorecard.dev/viewer/?uri=github.com/apolenkov/agent-runner-guard)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ![Four runs under the guard: DONE, RATE_LIMIT, WAITING and FAILED verdicts](demo/demo.gif)
 
 A guard that wraps headless agent runs: `devin -p`, `pi -p` and `codex exec`.

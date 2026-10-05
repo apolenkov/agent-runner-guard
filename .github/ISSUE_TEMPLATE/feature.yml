@@ -1,0 +1,11 @@
+name: Feature
+description: An idea for agent-runner-guard
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes: { label: The problem it solves }
+    validations: { required: true }
+  - type: textarea
+    id: idea
+    attributes: { label: What you would like }
