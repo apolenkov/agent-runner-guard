@@ -58,7 +58,7 @@ const DEVIN_LIMIT_PATTERN =
   /Reached free model rate limit|too many requests|\b429\b/i;
 // Codex — свои фразы целиком: usage.?limit ловит идентификаторы в коде.
 const CODEX_LIMIT_PATTERN =
-  /you've hit your usage limit|usage limit (?:reached|exceeded)|RateLimitReached|usage_limit_reached|\busage_limited\b|too many requests|\b429\b/i;
+  /you've hit your usage limit|you hit your spend cap|usage limit (?:reached|exceeded)|RateLimitReached|usage_limit_reached|\busage_limited\b|too many requests|\b429\b/i;
 const OTHER_LIMIT_PATTERN = /rate.?limit|too many requests|\b429\b|quota/i;
 const LIMIT_PATTERN: Record<Executor, RegExp> = {
   codex: CODEX_LIMIT_PATTERN,
@@ -93,11 +93,12 @@ const LIVE_PATTERNS: Partial<Record<Executor, [AlertType, RegExp][]>> = {
       /^warning: rejected a tool call that requires confirmation\. Running in non-interactive mode/m,
     ],
   ],
-  // ponytail: формат Codex не подтверждён живым лимитом (спайк S2 спеки)
+  // Живой текст Codex 0.160.0 (2026-10-05): «ERROR: You hit your spend cap set by the
+  // owner of your workspace. …»; усечённый «usage limit» — по документации, живьём не видели.
   codex: [
     [
       "rate_limit",
-      /^(?:\[[^\]\n]*\]\s*)?ERROR:?\s[^\n]*(?:hit your usage limit|usage_limit_reached)/im,
+      /^(?:\[[^\]\n]*\]\s*)?ERROR:?\s[^\n]*(?:hit your (?:usage limit|spend cap)|usage_limit_reached)/im,
     ],
   ],
 };
