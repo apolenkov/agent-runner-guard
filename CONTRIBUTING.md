@@ -18,7 +18,8 @@ repository root: `node src/watchdog.ts -- <command>`.
 - Every behaviour has a test under `test/`, named for the file it covers, run by
   `node --test`. Tests spawn real processes; the whole run takes about two minutes.
 - [Conventional Commits](https://www.conventionalcommits.org) with a scope:
-  `watchdog`, `hook`, `pi-alert`, `devin`, `repo`, `deps`, `ci`, `readme`.
+  `watchdog`, `hook`, `pi-alert`, `devin`, `repo`, `deps`, `ci`, `readme`, `main`.
+  Releases are cut by release-please (scope `main` is its PR).
   Git hooks (lefthook) run format and lint on commit, commitlint on the message
   and the full check on push; do not bypass them.
 
