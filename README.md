@@ -5,6 +5,7 @@
 
 [![ci](https://github.com/apolenkov/agent-runner-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/apolenkov/agent-runner-guard/actions/workflows/ci.yml)
 [![codeql](https://github.com/apolenkov/agent-runner-guard/actions/workflows/codeql.yml/badge.svg)](https://github.com/apolenkov/agent-runner-guard/actions/workflows/codeql.yml)
+[![release](https://img.shields.io/github/v/release/apolenkov/agent-runner-guard?sort=semver)](https://github.com/apolenkov/agent-runner-guard/releases)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/apolenkov/agent-runner-guard/badge)](https://scorecard.dev/viewer/?uri=github.com/apolenkov/agent-runner-guard)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -18,6 +19,7 @@ is always a verdict.
 
 Not published and not packaged: run it straight from a checkout with Node 26+
 (TypeScript is executed natively).
+Tags, GitHub Releases and the CHANGELOG are kept by release-please; nothing is published to a registry.
 
 ## Usage
 

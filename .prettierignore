@@ -1,2 +1,5 @@
 node_modules/
 package-lock.json
+# Written by release-please in its own JSON/Markdown layout.
+.release-please-manifest.json
+CHANGELOG.md

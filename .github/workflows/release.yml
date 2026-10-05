@@ -1,0 +1,48 @@
+name: release
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      # release-please pushes the release PR with GITHUB_TOKEN. Its actor, github-actions[bot],
+      # is an outside contributor to the "all external contributors" approval policy, so the
+      # pull_request runs of that PR (ci, codeql) wait as action_required and nobody started
+      # them. Approve them, and only them: the PR's author must be the bot and its branch must
+      # be release-please's. The policy itself stays strict on purpose (a looser one lets
+      # anyone with one merged commit run workflows); do not "simplify" this away.
+      - name: Approve the runs of the release PR
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PRS: ${{ steps.release.outputs.prs }}
+        run: |
+          set -euo pipefail
+          for branch in $(jq -r '.[].headBranchName | select(startswith("release-please--"))' <<<"$PRS"); do
+            author=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f head="${REPO%%/*}:$branch" --jq '.[0].user.login // empty')
+            [ "$author" = "github-actions[bot]" ] || { echo "$branch: author is '$author', not approving"; continue; }
+            sha=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha)
+            for _ in $(seq 12); do
+              runs=$(gh api "repos/$REPO/actions/runs?head_sha=$sha&event=pull_request" --jq '.workflow_runs')
+              for id in $(jq -r '.[] | select(.conclusion == "action_required") | .id' <<<"$runs"); do
+                gh api -X POST "repos/$REPO/actions/runs/$id/approve" --silent || true
+              done
+              # Done once the runs exist and none waits any more.
+              if [ "$(jq length <<<"$runs")" -gt 0 ] && ! jq -e 'any(.[]; .conclusion == "action_required")' <<<"$runs" >/dev/null; then break; fi
+              sleep 10
+            done
+          done

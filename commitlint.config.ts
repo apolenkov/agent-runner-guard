@@ -12,7 +12,17 @@ const config: UserConfig = {
     "scope-enum": [
       RuleConfigSeverity.Error,
       "always",
-      ["watchdog", "hook", "pi-alert", "devin", "repo", "deps", "ci", "readme"],
+      [
+        "watchdog",
+        "hook",
+        "pi-alert",
+        "devin",
+        "repo",
+        "deps",
+        "ci",
+        "readme",
+        "main",
+      ],
     ],
   },
 };
