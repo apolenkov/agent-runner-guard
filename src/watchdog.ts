@@ -21,10 +21,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import {
   chmod,
+  link,
   mkdir,
   open,
   readFile,
-  link,
   rename,
   rm,
   rmdir,
@@ -34,16 +34,16 @@ import {
 import { constants, homedir } from "node:os";
 import path from "node:path";
 
-import { mask } from "./mask.ts";
-import { listProcesses } from "./proc.ts";
-import { readTail } from "./tail.ts";
 import {
   cpuTimeSum,
+  type Executor,
   executorOf,
   findAcpLog,
   isDevinAcp,
-} from "./sources/devin-process.ts";
-import type { Executor } from "./source.ts";
+} from "./devin.ts";
+import { mask } from "./mask.ts";
+import { listProcesses } from "./proc.ts";
+import { readTail } from "./tail.ts";
 
 const TAIL_BYTES = 64 * 1024;
 const POLL_MS = 2000;
