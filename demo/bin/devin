@@ -1,0 +1,9 @@
+#!/bin/sh
+# Stand-in for `devin -p`: the prompt picks the scenario.
+case "$*" in
+*lint*) echo "Reading src/index.ts"; sleep 1; echo "Fixed 3 lint errors."; exit 0 ;;
+*refactor*) echo "Planning the refactor"; sleep 1
+  echo "Error: Reached free model rate limit. Usage will reset in 5 minutes."; sleep 30 ;;
+*) echo "Running tests"; sleep 1
+  echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode"; sleep 30 ;;
+esac

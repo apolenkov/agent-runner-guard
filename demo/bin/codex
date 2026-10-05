@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in for `codex exec`: finishes by itself.
+echo "Reviewing the diff"; sleep 1; echo "No issues found."; exit 0

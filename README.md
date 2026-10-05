@@ -1,5 +1,7 @@
 # agent-runner-guard
 
+![Four runs under the guard: DONE, RATE_LIMIT, WAITING and FAILED verdicts](demo/demo.gif)
+
 A guard that wraps headless agent runs: `devin -p`, `pi -p` and `codex exec`.
 It starts the command in its own process group, passes the output through,
 watches for signs of life and stops only its own group when the run goes silent,
