@@ -1,0 +1,11 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "src/watchdog.ts",
+    "src/hooks/wrap-runner-command.ts",
+    "src/harness/pi-alert.ts",
+    "test/**/*.test.ts"
+  ],
+  "ignoreBinaries": ["mkfifo"],
+  "project": ["{src,test}/**/*.ts", "*.config.ts"]
+}

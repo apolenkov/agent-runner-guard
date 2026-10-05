@@ -1,0 +1,5 @@
+ls:
+  "{src,test}/**/*":
+    .ts: kebab-case
+ignore:
+  - node_modules
