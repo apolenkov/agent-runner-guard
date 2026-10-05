@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in for `pi -p`: gives up with an error through the alert file.
+echo "Calling the model"; sleep 1
+printf '%s\n' '{"type":"error","message":"provider returned 500 after 3 retries"}' >> "$HARNESS_ALERT_FILE"
+sleep 30
