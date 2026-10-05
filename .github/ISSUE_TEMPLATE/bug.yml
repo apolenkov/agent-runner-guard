@@ -1,0 +1,24 @@
+name: Bug
+description: Something agent-runner-guard does wrong
+labels: [bug]
+body:
+  - type: input
+    id: node
+    attributes: { label: Node version, placeholder: "node --version" }
+    validations: { required: true }
+  - type: textarea
+    id: command
+    attributes:
+      label: The command the guard wrapped
+      render: sh
+    validations: { required: true }
+  - type: input
+    id: verdict
+    attributes:
+      label: Last line of the output (the verdict)
+      placeholder: "DONE 0"
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: What you expected }
+    validations: { required: true }
