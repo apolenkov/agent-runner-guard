@@ -437,6 +437,8 @@ void test("RATE_LIMIT codex: «usage limit», «RateLimitReached», «usage_limi
     "You've hit your usage limit",
     "RateLimitReached",
     "usage_limited",
+    // дословно из настоящего codex exec 0.160.0 при лимите расходов (2026-10-05)
+    "ERROR: You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.",
   ]) {
     const other = await mkdtemp(path.join(tmpdir(), "watchdog-codex-"));
     try {
@@ -1379,6 +1381,13 @@ void test("liveEvent: только завершённые строки, обре
     liveEvent("  /you've hit your usage limit|usage_limit_reached/\n", "codex"),
     undefined,
   );
+  // дословный хвост настоящего codex exec 0.160.0 при лимите расходов (2026-10-05)
+  const spendCap =
+    "user\nReply with the single word: ok\nhook: UserPromptSubmit Completed\n" +
+    "ERROR: You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.\n";
+  assert.equal(liveEvent(spendCap, "codex")?.type, "rate_limit");
+  assert.equal(liveEvent("  // you hit your spend cap\n", "codex"), undefined);
+  assert.ok(findRateLimit(spendCap, "codex", 1_000_000) !== undefined);
 });
 
 // Ревью Codex (TASK-271): прошлый вывод, смешение потоков, относительный путь, маска.
