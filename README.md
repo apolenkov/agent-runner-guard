@@ -71,19 +71,36 @@ group at once instead of waiting for the command to exit.
 ## Claude Code hook
 
 `src/hooks/wrap-runner-command.ts` is a PreToolUse hook for the Bash tool. It reads
-the hook JSON on stdin; when the command contains `devin -p`, `pi -p` or
-`codex exec`, it answers with `updatedInput` that runs the command through the
-guard:
+the hook JSON on stdin; for supported command positions containing `devin -p`,
+`pi -p` or `codex exec`, it answers with `updatedInput` that runs the command
+through the guard:
 
 ```
-node '<repo>/src/watchdog.ts' --silence 600 --max-seconds <tool timeout - 15, at least 30> [--watch-file '<redirect target>'] -- bash -c '<command>'
+node '<repo>/src/watchdog.ts' --silence 600 --max-seconds <floor(tool timeout in seconds - 15)> [--watch-file '<redirect target>'] -- bash -c '<command>'
 ```
 
-The ceiling follows the Bash tool timeout (default 120 s foreground, 30 min in
-background), so the guard writes its verdict before the tool cuts the call. When
-the command redirects stdout to a file, that file becomes `--watch-file`. The hook
-never blocks: any failure, foreign command or missing guard yields empty output
-and exit code 0, and the command runs as is.
+The ceiling follows a finite positive numeric Bash tool timeout, reserving 15 s
+for stopping, cleanup and the verdict. Defaults remain 120 s foreground and
+30 min when `run_in_background` is true, giving ceilings of 105 s and 1785 s.
+A 20 s timeout gives a 5 s ceiling; 16 s is the smallest budget that permits a
+whole-second ceiling. Smaller budgets, including 1500 ms and 15 s, yield empty
+output and exit code 0 before adding the guard or Pi extension. Those commands
+run unchanged and are unsupervised by this hook. A positive nonfinite numeric
+timeout also passes unchanged; missing, nonnumeric or nonpositive values retain
+the default fallback. Other tool input fields are preserved. The reserve is a
+scheduling margin, not an absolute guarantee under host load or OS scheduling.
+
+Classification uses a bounded literal shell grammar: simple commands, supported
+`env`/`exec`/`nohup`/`nice`/`timeout` wrappers, lists, pipelines and subshells.
+Codex `exec` may follow supported global options. Quoted runner text, comments,
+heredoc bodies, functions, loops and conditionals are not treated as runner
+invocations. Expansions and dynamic command/path values are not evaluated;
+unsupported commands pass unchanged or retain unknown metadata. The grammar
+assumes ordinary builtins without alias/function overrides or inherited startup
+scripts. Literal `cd ... &&` changes are followed in order; a known stdout
+destination becomes `--watch-file`. The hook never blocks: any failure, foreign
+command or missing guard yields empty output and exit code 0, and the command
+runs as is.
 
 ## Pi extension
 

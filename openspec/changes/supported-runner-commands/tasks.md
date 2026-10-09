@@ -1,0 +1,5 @@
+- [x] 1. Preserve accepted input and primary parser/Codex documentation; prove latest distributed WASM compatibility.
+- [x] 2. Record test-audit contracts and public CLI RED for the six findings.
+- [x] 3. Share bounded parser metadata across hook and watchdog; preserve argv and exact command bytes.
+- [x] 4. Run focused GREEN, existing command siblings, scoped type/lint/format and strict OpenSpec validation.
+- [x] 5. Freeze scoped patch, source hashes and receipts for fresh independent review.

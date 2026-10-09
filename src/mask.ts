@@ -10,17 +10,18 @@
  *   `monkeyPatch`), тоже маскируется — сознательно консервативно;
  * - пробелы вокруг `=` (`api_key = "…"`), пара `имя: "значение"` в кавычках
  *   (JSON/YAML), `Authorization: <схема> <токен>`;
+ * - внутри кавычек обратная косая черта и следующий знак — одна пара;
  * - токены с префиксами `ghp_`/`gho_`/…, `xoxb-`…, `AKIA` + 16 знаков;
  * - пути к `credentials.toml` (весь путь — `<credentials>`).
  */
 export function mask(text: string): string {
   return text
     .replaceAll(
-      /(\b[\w-]*(?:token|secret|key|password|pass|credential)[\w-]*[ \t]*=[ \t]*)(?:"[^"]*"|'[^']*'|\S*)/gi,
+      /(\b[\w-]*(?:token|secret|key|password|pass|credential)[\w-]*[ \t]*=[ \t]*)(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\S*)/gi,
       (_m, head: string) => `${head}***`,
     )
     .replaceAll(
-      /(\b[\w-]*(?:token|secret|key|password|pass|credential)[\w-]*["']?[ \t]*:[ \t]*)(?:"[^"]*"|'[^']*')/gi,
+      /(\b[\w-]*(?:token|secret|key|password|pass|credential)[\w-]*["']?[ \t]*:[ \t]*)(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')/gi,
       (_m, head: string) => `${head}***`,
     )
     .replaceAll(

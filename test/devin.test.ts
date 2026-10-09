@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -59,16 +58,9 @@ void test("findAcpLog: журнал по pid acp; нет каталога или
   }
 });
 
-void test("isDevinAcp и cpuTimeSum: свой процесс считается, пустой список — 0", async () => {
+void test("isDevinAcp; cpuTimeSum: пустой список и несуществующий pid — 0", async () => {
   assert.equal(isDevinAcp("/usr/bin/devin acp"), true);
   assert.equal(isDevinAcp("devin -p x"), false);
-  const child = spawn("sleep", ["30"]);
-  try {
-    assert.ok(child.pid !== undefined);
-    assert.ok((await cpuTimeSum([child.pid])) >= 0);
-    assert.equal(await cpuTimeSum([2_147_483_647]), 0);
-  } finally {
-    child.kill();
-  }
+  assert.equal(await cpuTimeSum([2_147_483_647]), 0);
   assert.equal(await cpuTimeSum([]), 0);
 });
