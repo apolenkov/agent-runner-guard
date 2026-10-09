@@ -1,6 +1,10 @@
 node_modules/
 .DS_Store
 
+# Local worktrees and agent process notes are not product source.
+/.worktrees/
+/.superpowers/
+
 # OpenSpec native adapters: regenerate with openspec init; preserve vendor bytes.
 /.agents/skills/openspec-*/
 /.agents/skills/.openspec-target
