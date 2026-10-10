@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/apolenkov/agent-runner-guard/compare/v0.1.0...v0.1.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* **watchdog:** preserve delegated command and output handling ([#9](https://github.com/apolenkov/agent-runner-guard/issues/9)) ([12614bf](https://github.com/apolenkov/agent-runner-guard/commit/12614bf80d64e7d8494e9b0077a996d9501cfd73))
+
 ## 0.1.0 (2026-10-05)
 
 
