@@ -1414,6 +1414,60 @@ void test("старые строки в дописываемом файле (>>)
   }
 });
 
+void test("current-run diagnostics: old 429/exit=1 never poisons fresh failure or benign append", async (t) => {
+  for (const [name, append, code] of [
+    ["no current file write", "", 3],
+    ["current benign append", "current work\n", 3],
+    ["watched exit is diagnostic only", "current work\nexit=7\n", 0],
+  ] as const) {
+    await t.test(name, async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), "watchdog-current-"));
+      const out = path.join(directory, "run.out");
+      const limits = path.join(directory, "limits");
+      const devin = path.join(directory, "devin");
+      try {
+        const old =
+          code === 0 ? "old ordinary output\n" : "old diagnostic 429\nexit=1\n";
+        await writeFile(out, old);
+        await writeFile(
+          devin,
+          `#!${process.execPath}\nconst fs = require("node:fs"); const [file, text, code] = process.argv.slice(3); if (text) fs.appendFileSync(file, text); process.exitCode = Number(code);\n`,
+        );
+        await chmod(devin, 0o755);
+        const result = spawnSync(
+          process.execPath,
+          [
+            WATCHDOG,
+            "--watch-file",
+            out,
+            "--",
+            devin,
+            "-p",
+            out,
+            append,
+            String(code),
+          ],
+          {
+            env: { ...process.env, EXECUTOR_LIMITS_DIR: limits },
+            encoding: "utf8",
+            timeout: 10_000,
+          },
+        );
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, code, result.stdout + result.stderr);
+        assert.equal(result.stdout, `DONE ${String(code)}\n`);
+        assert.equal(result.stderr, "");
+        await assert.rejects(stat(path.join(limits, "devin")), {
+          code: "ENOENT",
+        });
+        assert.equal(await readFile(out, "utf8"), `${old}${append}`);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 void test("stdout без перевода строки не ломает начало строки в stderr → WAITING", async () => {
   const result = await watchdog([
     "--max-seconds",
@@ -1458,17 +1512,75 @@ void test("относительный --alert-file: команда сменил�
   }
 });
 
-void test("сообщение события маскируется (ключи не печатаются)", async () => {
+void test("сообщение события маскируется (ключи не печатаются)", async (t) => {
   const secret = ["sk", "live", "abcdef123456"].join("-");
-  const event = JSON.stringify({ type: "error", message: `api_key=${secret}` });
-  const result = await watchdog([
-    "--",
-    "sh",
-    "-c",
-    `echo '${event}' >> "$HARNESS_ALERT_FILE"`,
-  ]);
-  assert.equal(result.code, 79, result.stdout);
-  assert.doesNotMatch(result.stdout, new RegExp(secret));
+  const cases = [
+    ["simple key", `api_key=${secret}`, "api_key=***"],
+    [
+      "double-quoted assignment",
+      String.raw`before password="synthetic-alpha\"synthetic-omega" color=blue`,
+      "before password=*** color=blue",
+    ],
+    [
+      "single-quoted assignment",
+      String.raw`before token = 'synthetic-alpha\'synthetic-omega' color=blue`,
+      "before token = *** color=blue",
+    ],
+    [
+      "double-quoted colon value",
+      String.raw`before {"api_key": "synthetic-alpha\\\"synthetic-omega", "color": "blue"} after`,
+      'before {"api_key": ***, "color": "blue"} after',
+    ],
+    [
+      "single-quoted colon value",
+      String.raw`before secret: 'synthetic-alpha\'synthetic-omega' color=blue`,
+      "before secret: *** color=blue",
+    ],
+    [
+      "escaped backslash before closing quote",
+      String.raw`before password="synthetic-alpha\\" color="blue" after`,
+      'before password=*** color="blue" after',
+    ],
+  ] as const;
+  for (const [name, message, masked] of cases) {
+    await t.test(name, async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), "watchdog-mask-"));
+      try {
+        const result = spawnSync(
+          process.execPath,
+          [
+            WATCHDOG,
+            "--max-seconds",
+            "5",
+            "--alert-file",
+            path.join(directory, "alert.jsonl"),
+            "--",
+            process.execPath,
+            "-e",
+            String.raw`const fs = require("node:fs"); const message = process.argv[1]; console.log(message); fs.appendFileSync(process.env.HARNESS_ALERT_FILE, JSON.stringify({type: "error", message}) + "\n"); setTimeout(() => {}, 2000);`,
+            message,
+          ],
+          {
+            env: {
+              ...process.env,
+              EXECUTOR_LIMITS_DIR: path.join(directory, "limits"),
+            },
+            encoding: "utf8",
+            timeout: 10_000,
+          },
+        );
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 79, result.stdout);
+        assert.equal(result.stderr, "");
+        assert.equal(
+          result.stdout,
+          `${message}\nWATCHDOG: событие: error: ${masked}\nFAILED ${masked}\n`,
+        );
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 void test("существующий файл перезаписан (>) — событие в начале нового содержимого видно → WAITING", async () => {
@@ -1490,6 +1602,163 @@ void test("существующий файл перезаписан (>) — со
     assert.equal(result.code, 78, result.stdout);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+async function waitOutput(read: () => string, line: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (read().includes(line)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`synthetic child never acknowledged ${line}: ${read()}`);
+}
+
+void test("current-run observation: equal-size rewrite stops on the live event before ceiling", async (t) => {
+  for (const [name, replacement, refusal] of [
+    ["same-file refusal", false, true],
+    ["replacement refusal", true, true],
+    ["same-file healthy control", false, false],
+  ] as const) {
+    await t.test(name, async () => {
+      const directory = await mkdtemp(
+        path.join(tmpdir(), "watchdog-revision-"),
+      );
+      const out = path.join(directory, "run.out");
+      const barrier = path.join(directory, "rewrite");
+      const stopped = path.join(directory, "stopped.json");
+      const devin = path.join(directory, "devin");
+      const oldEdge = `${DEVIN_REJECTED}\n`.slice(-64);
+      // Replacement retains the old marked edge: only file identity disambiguates it.
+      const neutral = replacement
+        ? `${"n".repeat(Buffer.byteLength(DEVIN_REJECTED) + 1 - oldEdge.length)}${oldEdge}`
+        : `${"n".repeat(Buffer.byteLength(DEVIN_REJECTED))}\n`;
+      const rewritten = refusal
+        ? `${DEVIN_REJECTED}\n`
+        : `${"h".repeat(Buffer.byteLength(DEVIN_REJECTED))}\n`;
+      assert.equal(Buffer.byteLength(neutral), Buffer.byteLength(rewritten));
+      await writeFile(out, neutral);
+      await writeFile(
+        devin,
+        String.raw`#!${process.execPath}
+const fs = require("node:fs");
+const [file, barrier, stopped, directory, text, replacement, refusal] = process.argv.slice(3);
+fs.writeFileSync(directory + "/group.pid", String(process.pid) + "\n");
+let rewritten;
+process.on("SIGTERM", () => {
+  fs.writeFileSync(stopped, JSON.stringify({ rewritten, signalled: Date.now() }));
+  process.exit(0);
+});
+console.log("runner ready");
+const poll = setInterval(() => {
+  if (!fs.existsSync(barrier)) return;
+  clearInterval(poll);
+  if (replacement === "true") {
+    fs.writeFileSync(file + ".new", text);
+    fs.renameSync(file + ".new", file);
+  } else fs.writeFileSync(file, text);
+  rewritten = Date.now();
+  console.log("rewrite complete");
+  if (refusal === "false") setTimeout(() => process.exit(0), 500);
+  else setInterval(() => {}, 1000);
+}, 25);
+`,
+      );
+      await chmod(devin, 0o755);
+      const neighbour = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        {
+          stdio: "ignore",
+        },
+      );
+      const neighbourClosed = new Promise<void>((resolve) =>
+        neighbour.on("close", resolve),
+      );
+      const launched = Date.now();
+      const child = spawn(
+        process.execPath,
+        [
+          WATCHDOG,
+          "--silence",
+          "10",
+          "--max-seconds",
+          "4",
+          "--watch-file",
+          out,
+          "--",
+          devin,
+          "-p",
+          out,
+          barrier,
+          stopped,
+          directory,
+          rewritten,
+          String(replacement),
+          String(refusal),
+        ],
+        {
+          env: {
+            ...process.env,
+            EXECUTOR_LIMITS_DIR: path.join(directory, "limits"),
+          },
+        },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      const closed = new Promise<number | null>((resolve) =>
+        child.on("close", resolve),
+      );
+      const timer = setTimeout(() => child.kill("SIGTERM"), 12_000);
+      try {
+        await waitOutput(() => stdout, "runner ready\n");
+        // Public CLI has no read acknowledgement; a roomy neutral dwell allows live polling.
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        await writeFile(barrier, "go\n");
+        await waitOutput(() => stdout, "rewrite complete\n");
+        const code = await closed;
+        assert.equal(stderr, "");
+        assert.equal(
+          neighbour.exitCode,
+          null,
+          "unrelated owned control was stopped",
+        );
+        assert.equal(neighbour.signalCode, null);
+        assert.ok(neighbour.pid !== undefined);
+        process.kill(neighbour.pid, 0);
+        if (refusal) {
+          const timing = JSON.parse(await readFile(stopped, "utf8")) as {
+            rewritten: number;
+            signalled: number;
+          };
+          t.diagnostic(JSON.stringify({ name, launched, ...timing, stdout }));
+          assert.equal(code, 78, stdout);
+          assert.match(stdout, /WATCHDOG: событие: waiting:/);
+          assert.doesNotMatch(stdout, /WATCHDOG: остановлен: потолок/);
+          assert.match(stdout, /WAITING .*rejected a tool call[^\n]*\n$/);
+          assert.ok(timing.signalled >= timing.rewritten);
+          assert.ok(
+            timing.signalled < launched + 4000,
+            JSON.stringify({ launched, ...timing }),
+          );
+        } else {
+          assert.equal(code, 0, stdout);
+          assert.match(stdout, /DONE 0\n$/);
+          assert.doesNotMatch(stdout, /WATCHDOG:|WAITING/);
+          await assert.rejects(stat(stopped), { code: "ENOENT" });
+        }
+        assert.equal(await readFile(out, "utf8"), rewritten);
+      } finally {
+        clearTimeout(timer);
+        child.kill("SIGTERM");
+        await closed;
+        await killRecorded(directory);
+        neighbour.kill("SIGTERM");
+        await neighbourClosed;
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
   }
 });
 
@@ -1603,5 +1872,118 @@ void test("старый отказ в файле, команда перезап�
     assert.equal(result.lastLine, "DONE 0", result.stdout);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+function directPromptCommand(prompt: string, script: string): string[] {
+  return [
+    "--silence",
+    "10",
+    "--max-seconds",
+    "8",
+    "--",
+    devinScript,
+    "-p",
+    "--prompt-file",
+    prompt,
+    "-c",
+    script,
+  ];
+}
+
+void test("command grammar: direct prompt argv admits distinct files and retains true BUSY", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchdog-argv-"));
+  const limits = path.join(directory, "limits");
+  const ready = path.join(directory, "ready");
+  const environment = { ...process.env, EXECUTOR_LIMITS_DIR: limits };
+  const firstPrompt = path.join(directory, "task one.md");
+  const secondPrompt = path.join(directory, "task two.md");
+  const first = spawn(
+    process.execPath,
+    [
+      WATCHDOG,
+      ...directPromptCommand(firstPrompt, `touch '${ready}'; sleep 5`),
+    ],
+    { env: environment, stdio: "ignore" },
+  );
+  const closed = new Promise<void>((resolve) =>
+    first.on("close", () => {
+      resolve();
+    }),
+  );
+  try {
+    let isReady = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await stat(ready);
+        isReady = true;
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert.ok(isReady, "synthetic first runner never became ready");
+    const duplicate = spawnSync(
+      process.execPath,
+      [WATCHDOG, ...directPromptCommand(firstPrompt, "echo duplicate")],
+      { env: environment, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(duplicate.error, undefined);
+    assert.equal(duplicate.status, 77, duplicate.stdout + duplicate.stderr);
+    assert.match(duplicate.stdout, /^BUSY \d+ /);
+    const distinct = spawnSync(
+      process.execPath,
+      [WATCHDOG, ...directPromptCommand(secondPrompt, "echo independent")],
+      { env: environment, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(distinct.error, undefined);
+    assert.equal(distinct.status, 0, distinct.stdout + distinct.stderr);
+    assert.equal(distinct.stdout, "independent\nDONE 0\n");
+    assert.equal(distinct.stderr, "");
+  } finally {
+    first.kill("SIGTERM");
+    await closed;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test("command grammar: grouped shell c options preserve live Codex classification", async (t) => {
+  for (const option of ["-c", "-ec", "-lc"]) {
+    await t.test(option, async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), "watchdog-shell-c-"));
+      try {
+        const result = spawnSync(
+          process.execPath,
+          [
+            WATCHDOG,
+            "--max-seconds",
+            "5",
+            "--",
+            "bash",
+            option,
+            `${codexScript} exec -c 'echo "ERROR: You hit your spend cap set by the owner of your workspace."'`,
+            "unused pi -p text",
+          ],
+          {
+            env: {
+              ...process.env,
+              EXECUTOR_LIMITS_DIR: path.join(directory, "limits"),
+            },
+            encoding: "utf8",
+            timeout: 10_000,
+          },
+        );
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 75, result.stdout + result.stderr);
+        assert.match(result.stdout, /RATE_LIMIT \d+\n$/);
+        assert.equal(result.stderr, "");
+        assert.match(
+          await readFile(path.join(directory, "limits", "codex"), "utf8"),
+          /^\d+\n$/,
+        );
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
   }
 });

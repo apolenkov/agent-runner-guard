@@ -34,16 +34,10 @@ import {
 import { constants, homedir } from "node:os";
 import path from "node:path";
 
-import {
-  cpuTimeSum,
-  type Executor,
-  executorOf,
-  findAcpLog,
-  isDevinAcp,
-} from "./devin.ts";
+import { cpuTimeSum, type Executor, findAcpLog, isDevinAcp } from "./devin.ts";
 import { mask } from "./mask.ts";
 import { listProcesses } from "./proc.ts";
-import { readTail } from "./tail.ts";
+import { analyzeCommand, promptPath } from "./shell-command.ts";
 
 const TAIL_BYTES = 64 * 1024;
 const POLL_MS = 2000;
@@ -102,9 +96,6 @@ const LIVE_PATTERNS: Partial<Record<Executor, [AlertType, RegExp][]>> = {
     ],
   ],
 };
-// Обёртки и приставки перед настоящей командой: env, VAR=1, timeout 600, …
-const PREFIX_TOKEN = /^(?:env|nohup|nice|exec|timeout|\w+=.*|-\S*|\d+[smhd]?)$/;
-
 export interface WatchdogArguments {
   silence: number;
   maxSeconds: number | undefined;
@@ -154,32 +145,7 @@ export function parseWatchdogArguments(argv: string[]): WatchdogArguments {
  * `sh|bash -c "<строка>"` — по первой подходящей команде строки.
  */
 export function detectExecutor(command: string[]): Executor | undefined {
-  const [binary, ...rest] = command;
-  if (binary === undefined) return undefined;
-  const direct = executorInLine(command.join(" "));
-  if (direct !== undefined) return direct;
-  if (!/^(?:ba|z)?sh$/.test(path.basename(binary))) return undefined;
-  if (!rest.includes("-c")) return undefined;
-  const script = rest[rest.indexOf("-c") + 1];
-  if (script === undefined) return undefined;
-  for (const part of script.split(/[;&|\n]+/)) {
-    const executor = executorInLine(part);
-    if (executor !== undefined) return executor;
-  }
-  return undefined;
-}
-
-/*
- * Исполнитель простой команды после обёрток (`env X=1`, `timeout 60`, …).
- */
-function executorInLine(line: string): Executor | undefined {
-  const tokens = line
-    .trim()
-    .split(/\s+/)
-    .map((token) => token.replace(/^\(+/, ""))
-    .filter((token) => token !== "");
-  const index = tokens.findIndex((token) => !PREFIX_TOKEN.test(token));
-  return index === -1 ? undefined : executorOf(tokens.slice(index).join(" "));
+  return analyzeCommand(command, process.cwd()).runners[0]?.executor;
 }
 
 /**
@@ -265,6 +231,7 @@ function alertEvent(text: string): HarnessEvent | undefined {
 interface FileMark {
   size: number;
   edge: Buffer;
+  identity?: string;
 }
 
 const EDGE_BYTES = 64;
@@ -272,8 +239,9 @@ const EDGE_BYTES = 64;
 const ALERT_BYTES = 1024 * 1024;
 
 /**
- * Отметка файла до запуска: размер и последние байты перед ним — по ним
- * дописывание (`>>`) отличается от перезаписи (`>`). Нет файла — пусто.
+ * Отметка файла до запуска: идентичность, размер и последние байты перед
+ * ним — по ним дописывание (`>>`) отличается от перезаписи (`>`).
+ * Нет файла — пусто.
  */
 async function markOf(file: string | undefined): Promise<FileMark> {
   const empty = { size: 0, edge: Buffer.alloc(0) };
@@ -284,10 +252,12 @@ async function markOf(file: string | undefined): Promise<FileMark> {
     if (!info.isFile()) return empty;
     const handle = await open(file, "r");
     try {
-      const { size } = await handle.stat();
+      const opened = await handle.stat();
+      if (!opened.isFile()) return empty;
+      const { size, dev, ino } = opened;
       const edge = Buffer.alloc(Math.min(EDGE_BYTES, size));
       await handle.read(edge, 0, edge.length, size - edge.length);
-      return { size, edge };
+      return { size, edge, identity: `${String(dev)}:${String(ino)}` };
     } finally {
       await handle.close();
     }
@@ -299,14 +269,15 @@ async function markOf(file: string | undefined): Promise<FileMark> {
 /**
  * Новое в файле после отметки до запуска (прошлый вывод `>>` не событие;
  * файл стал короче отметки или сменились её края — перезаписан, отметка
- * сбрасывается в 0 навсегда), не больше `limit` байт с конца; обрезанное
- * спереди окно теряет неполную первую строку. undefined — размер не
- * менялся с прошлого чтения (`seen`).
+ * сбрасывается в 0 навсегда), не больше `limit` байт с конца; замена файла
+ * также сбрасывает отметку. Обрезанное спереди окно теряет неполную первую
+ * строку. undefined — идентичность, размер и метаданные изменения не
+ * менялись с прошлого чтения (`seen`); это не гарантированная версия текста.
  */
 async function readNew(
   file: string | undefined,
   mark: FileMark,
-  seen: Map<string, number>,
+  seen: Map<string, string>,
   limit = TAIL_BYTES,
 ): Promise<string | undefined> {
   if (file === undefined) return undefined;
@@ -315,9 +286,14 @@ async function readNew(
     if (!info.isFile()) return undefined; // FIFO: open ждал бы писателя
     const handle = await open(file, "r");
     try {
-      const { size } = await handle.stat();
-      if (seen.get(file) === size) return undefined;
-      seen.set(file, size);
+      const opened = await handle.stat();
+      if (!opened.isFile()) return undefined;
+      const { size, dev, ino, mtimeMs, ctimeMs } = opened;
+      const identity = `${String(dev)}:${String(ino)}`;
+      const revision = `${identity}:${String(size)}:${String(mtimeMs)}:${String(ctimeMs)}`;
+      if (seen.get(file) === revision) return undefined;
+      if (mark.identity !== undefined && identity !== mark.identity)
+        mark.size = 0;
       if (size < mark.size) mark.size = 0; // `>` перезаписал: дальше — всё новое
       if (mark.size > 0) {
         const edge = Buffer.alloc(mark.edge.length);
@@ -331,6 +307,7 @@ async function readNew(
       const buffer = Buffer.alloc(size - start);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
       const text = buffer.subarray(0, bytesRead).toString("utf8");
+      seen.set(file, revision);
       return start > base ? text.slice(text.indexOf("\n") + 1) : text;
     } finally {
       await handle.close();
@@ -354,21 +331,6 @@ async function createAlertFile(): Promise<string> {
   );
   await writeFile(file, "", { mode: 0o600, flag: "wx" });
   return file;
-}
-
-/**
-Последние TAIL_BYTES файла как текст (неполная первая строка отброшена —
-для `exit=N` и признака лимита это безвредно); нет файла или пути — пустая строка.
-*/
-async function readFileTail(file: string | undefined): Promise<string> {
-  if (file === undefined) return "";
-  try {
-    const info = await stat(file);
-    if (!info.isFile()) return ""; // FIFO: open ждал бы писателя
-    return (await readTail(file, TAIL_BYTES)) ?? "";
-  } catch {
-    return "";
-  }
 }
 
 /**
@@ -406,97 +368,17 @@ function limitsDirectory(): string {
 }
 
 /**
- * Путь из --prompt-file в строке команды (с кавычками и формой =путь);
- * нет флага — undefined.
- */
-function promptFileOf(line: string): string | undefined {
-  const file = /--prompt-file[=\s]("[^"]*"|'[^']*'|\S+)/.exec(line)?.[1];
-  return file?.replace(/^(['"])([\s\S]*)\1$/, "$2");
-}
-
-/**
- * Каталог первого «cd <dir> &&» в строке — туда резолвятся относительные
- * пути команды; нет — undefined.
- */
-function cdDirectoryOf(line: string): string | undefined {
-  const directory = /\bcd\s+("[^"]*"|'[^']*'|[^\s;&|]+)\s*&&/.exec(line)?.[1];
-  return directory?.replace(/^(['"])([\s\S]*)\1$/, "$2");
-}
-
-// Редиректы вывода: `> f`, `>>f`, `2>f`, `2>&1`, `&> f`, `>&2`.
-const REDIRECT = /^(?:\d+|&)?>>?[ \t]*(?:"[^"]*"|'[^']*'|&\d+|[^\s;|>&"']+)/;
-
-/**
- * Сохраняем кавычки и экранирование посимвольно; редиректы и лишние
- * пробелы убираем только снаружи аргументов оболочки.
- */
-function normalizeShell(line: string): string {
-  let result = "";
-  let quote: string | undefined;
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    if (char === undefined) break;
-    if (char === "\\" && quote !== "'") {
-      result += char + (line[index + 1] ?? "");
-      index += 1;
-    } else if (quote !== undefined) {
-      result += char;
-      if (char === quote) quote = undefined;
-    } else if (char === "'" || char === '"') {
-      quote = char;
-      result += char;
-    } else {
-      const isBoundary = index === 0 || /[\s;&|]/.test(line[index - 1] ?? "");
-      const redirect =
-        isBoundary || char === ">" || char === "&"
-          ? REDIRECT.exec(line.slice(index))
-          : null;
-      if (redirect !== null) {
-        if (!result.endsWith(" ")) result += " ";
-        index += redirect[0].length - 1;
-      } else if (/\s/.test(char)) {
-        if (!result.endsWith(" ")) result += " ";
-      } else {
-        result += char;
-      }
-    }
-  }
-  return result.trim();
-}
-
-/**
- * Идентичность запуска для замка: исполнитель + абсолютный путь
- * --prompt-file, иначе исполнитель + строка команды без редиректов
- * вывода оболочки (cd остаётся) и реальный рабочий каталог. Кавычки и
- * границы argv сохраняются. Повтор одной задачи
- * под другим `> файл` — тот же ключ.
+ * Исполнитель + полный literal prompt-файл, иначе cwd + argv; AST удаляет
+ * только настоящие shell-редиректы из запасной идентичности.
  */
 function lockIdentity(
   command: string[],
   executor: Executor | undefined,
 ): string {
-  const line = command.join(" ");
-  const promptFile = promptFileOf(line);
-  if (promptFile !== undefined) {
-    const base = cdDirectoryOf(line) ?? process.cwd();
-    return `${executor ?? "-"}|file:${path.resolve(base, promptFile)}`;
-  }
-  // В прямом argv символ > — обычный текст. Оболочкой разбирается
-  // только аргумент после -c; остальные границы аргументов сохраняются.
-  const isShell = /^(?:ba|z)?sh$/.test(path.basename(command[0] ?? ""));
-  const scriptIndex = isShell
-    ? command.findIndex(
-        (argument, index) => index > 0 && /^-[^-]*c/.test(argument),
-      ) + 1
-    : 0;
-  const normalised = JSON.stringify(
-    command.map((argument, index) =>
-      index === scriptIndex && scriptIndex > 0
-        ? normalizeShell(argument)
-        : argument,
-    ),
-  );
-  return `${executor ?? "-"}|cwd:${realpathSync(process.cwd())}|cmd:${normalised}`;
+  const analysis = analyzeCommand(command, process.cwd());
+  const prompt = promptPath(analysis.runners[0]);
+  if (prompt !== undefined) return `${executor ?? "-"}|file:${prompt}`;
+  return `${executor ?? "-"}|cwd:${realpathSync(process.cwd())}|cmd:${JSON.stringify(analysis.normalized)}`;
 }
 
 /**
@@ -548,18 +430,13 @@ async function readLock(file: string): Promise<LockContent | undefined> {
 }
 
 /**
- * Файл вывода команды: цель последнего `>`/`>>` (кроме `2>`/`>&`) в строке;
- * редиректа нет — undefined.
+ * Literal stdout-файл первого раннера или последней простой shell-команды;
+ * неизвестная цель / отсутствие редиректа — undefined.
  * @internal Экспорт для тестов.
  */
 export function outputFileOf(command: string[]): string | undefined {
-  let file: string | undefined;
-  for (const match of command
-    .join(" ")
-    .matchAll(/(?<![0-9>&])>>?[ \t]*("[^"]*"|'[^']*'|[^\s;|>&"']+)/g)) {
-    file = match[1];
-  }
-  return file?.replace(/^(['"])([\s\S]*)\1$/, "$2");
+  const analysis = analyzeCommand(command, process.cwd());
+  return analysis.runners[0]?.outputFile ?? analysis.outputFile;
 }
 
 /**
@@ -950,7 +827,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   }
   let lastSample = Date.now();
   let stopText = "";
-  const sizes = new Map<string, number>();
+  const revisions = new Map<string, string>();
   void exit.then(() => {
     state.isFinished = true;
   });
@@ -966,12 +843,12 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       return 141;
     }
     // ??= после await: событие из потока, пришедшее во время чтения, не теряется
-    const watched = await readNew(arguments_.watchFile, watchFrom, sizes);
+    const watched = await readNew(arguments_.watchFile, watchFrom, revisions);
     if (watched !== undefined) state.event ??= liveEvent(watched, executor);
     const alerted = await readNew(
       arguments_.alertFile,
       alertFrom,
-      sizes,
+      revisions,
       ALERT_BYTES,
     );
     if (alerted !== undefined) state.event ??= alertEvent(alerted);
@@ -1045,9 +922,11 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
   }
   if (!state.isNewlineEnded) process.stdout.write("\n");
 
-  // вывод исполнителя мог уйти в файл (`> run.out; echo exit=$? >> run.out`):
-  // тогда хвост и настоящий код выхода берутся из него
-  const fileTail = await readFileTail(arguments_.watchFile);
+  // Вывод мог уйти в файл: финальные события и лимит берём только после
+  // отметки этого запуска. exit=N — диагностика вложенной команды;
+  // результат supplied command всегда остаётся result.code.
+  const fileTail =
+    (await readNew(arguments_.watchFile, watchFrom, new Map())) ?? "";
   // финальная проверка: событие могло прийти перед самым выходом
   const event =
     state.event ??
@@ -1061,10 +940,7 @@ async function runWatchdog(arguments_: WatchdogArguments): Promise<number> {
       executor,
       streamTails.stderr.length >= TAIL_BYTES,
     ) ??
-    liveEvent(
-      `${(await readNew(arguments_.watchFile, watchFrom, new Map())) ?? ""}\n`,
-      executor,
-    ) ??
+    liveEvent(`${fileTail}\n`, executor) ??
     alertEvent(
       (await readNew(
         arguments_.alertFile,

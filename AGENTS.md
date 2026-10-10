@@ -14,3 +14,8 @@ This repository contains a watchdog for delegated CLI processes. Read
   task-owned child process running after a check.
 - Commit with an allowed scope from CONTRIBUTING, for example `docs(repo): ...`.
   Keep the existing hooks; release-please manages tags and release history.
+- Check parallel sessions and worktrees with the coordinator before editing;
+  agree file ownership and preserve another session's changes and check inputs.
+- Follow CONTRIBUTING's layout and publication boundaries. Runtime locks, alerts
+  and limit records belong to the configured state directory. Keep worktrees and
+  process notes outside tracked source; preserve unique handoffs durably.

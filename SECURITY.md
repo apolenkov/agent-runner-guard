@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-agent-runner-guard has no releases; only the latest `main` is supported.
+Only the latest `main` is supported; tagged releases are not maintained for security fixes.
 
 ## Reporting a vulnerability
 

@@ -10,79 +10,14 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const RUNNER = /(?<![\w-])(?:(?:devin|pi)\s+-p|codex\s+exec)(?!\w)/;
+import { analyzeShell } from "../shell-command.ts";
 
-/**
- * Куда команда отправляет вывод исполнителя: первая перенаправленная
- * в файл стандартная выдача (`> f`, `>> f`, `1> f`, в кавычках или без)
- * после `devin -p`/`pi -p`. Нет — undefined (вывод и так виден сторожу).
- */
+/** Literal effective stdout destination of the first supported runner. */
 export function outputFileOf(
   command: string,
   cwd?: string,
 ): string | undefined {
-  const start = RUNNER.exec(command)?.index ?? 0;
-  const redirect =
-    /(?:^|[\s;])1?>>?\s*(?:'([^']+)'|"([^"]+)"|([^\s;&|<>]+))/.exec(
-      command.slice(start),
-    );
-  const target = redirect?.[1] ?? redirect?.[2] ?? redirect?.[3];
-  if (target === undefined || target.startsWith("&")) return undefined;
-  if (target === "/dev/null") return undefined;
-  if (path.isAbsolute(target)) return target;
-  // сторож работает в каталоге инструмента, а `cd` внутри команды — в дочерней оболочке:
-  // относительный путь разрешаем от последнего `cd` перед исполнителем (или от cwd хука)
-  const changes = command
-    .slice(0, start)
-    .matchAll(/(?:^|[\s;&|(])cd\s+(?:'([^']+)'|"([^"]+)"|([^\s;&|<>]+))/g)
-    .toArray();
-  const last = changes.at(-1);
-  const directory = last?.[1] ?? last?.[2] ?? last?.[3];
-  // `cd $VAR`, `cd ~` и подобное без оболочки не разрешить — лучше не следить, чем следить не туда
-  if (directory !== undefined && /^[$~]/.test(directory)) return undefined;
-  if (directory !== undefined && path.isAbsolute(directory)) {
-    return path.join(directory, target);
-  }
-  if (cwd === undefined || !path.isAbsolute(cwd)) return undefined;
-  return path.join(cwd, directory ?? "", target);
-}
-
-// `pi -p` в позиции команды: после начала строки или `;`, `&`, `|`, `(`,
-// через приставки (`env X=1`, `exec`, `timeout 600`, …) и с путём к файлу.
-const PI_COMMAND =
-  /(?<=(?:^|[;&|(\n])\s*)((?:(?:env|exec|nohup|nice|timeout|\w+=\S*|-\S+|\d+[smhd]?)\s+)*)(\S*\/)?pi(\s+)-p(?!\w)/g;
-
-/**
- * Добавляет `-e <расширение>` к первому `pi -p` в позиции команды (начало
- * строки или после `;`, `&`, `|`, `(`, в том числе за приставками и с
- * путём) и вне кавычек: текст промпта и
- * `echo 'pi -p'` не трогаются. Подходящего нет — строка как есть.
- */
-function withPiExtension(command: string, extension: string): string {
-  for (const match of command.matchAll(PI_COMMAND)) {
-    const [whole, prefix = "", directory = "", space = " "] = match;
-    // кавычки проверяются у самого токена pi: приставка `X="… pi -p` — текст
-    if (isQuotedAt(command, match.index + prefix.length + directory.length))
-      continue;
-    const quoted = extension.replaceAll("'", String.raw`'\''`);
-    return `${command.slice(0, match.index)}${prefix}${directory}pi -e '${quoted}'${space}-p${command.slice(match.index + whole.length)}`;
-  }
-  return command;
-}
-
-/**
- * Стоит ли позиция внутри кавычек оболочки (с учётом `\` вне одинарных).
- */
-function isQuotedAt(line: string, position: number): boolean {
-  let quote: string | undefined;
-  for (let index = 0; index < position; index += 1) {
-    const char = line[index];
-    if (char === "\\" && quote !== "'") index += 1;
-    else if (quote === undefined && (char === "'" || char === '"'))
-      quote = char;
-    else if (char === quote) quote = undefined;
-  }
-  return quote !== undefined;
+  return analyzeShell(command, cwd).runners[0]?.outputFile;
 }
 
 /**
@@ -101,7 +36,15 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
     if (toolName !== "Bash") return "";
     if (typeof toolInput !== "object" || toolInput === null) return "";
     const command = (toolInput as Record<string, unknown>)["command"];
-    if (typeof command !== "string" || !RUNNER.test(command)) return "";
+    if (typeof command !== "string") return "";
+    const analysis = analyzeShell(
+      command,
+      typeof cwd === "string" ? cwd : undefined,
+    );
+    const runners = analysis.runners.filter(
+      (runner) => runner.executor !== "pi" || runner.argv.includes("-p"),
+    );
+    if (runners.length === 0) return "";
     if (!existsSync(watchdogPath)) return "";
     // Передний план обрывается таймаутом Bash-инструмента раньше порога
     // тишины: сторож должен остановить группу и записать итог до него.
@@ -114,7 +57,11 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
     const fallbackMs = isBackground === true ? 1_800_000 : 120_000;
     const timeoutMs =
       typeof timeout === "number" && timeout > 0 ? timeout : fallbackMs;
-    const limit = ` --max-seconds ${String(Math.max(30, Math.floor(timeoutMs / 1000 - 15)))}`;
+    // Недостаточный бюджет проходит без сторожа и без расширения Pi.
+    if (!Number.isFinite(timeoutMs)) return "";
+    const maxSeconds = Math.floor(timeoutMs / 1000 - 15);
+    if (maxSeconds < 1) return "";
+    const limit = ` --max-seconds ${String(maxSeconds)}`;
     // Pi: расширение сообщает сторожу об ошибке/лимите (alert-файл)
     const extension = path.join(
       path.dirname(watchdogPath),
@@ -123,16 +70,16 @@ export function wrapRunnerCommand(input: string, watchdogPath: string): string {
     );
     // `<<` где угодно (heredoc, комментарии с кавычками) — не разбираем:
     // испортить тело heredoc хуже, чем остаться без расширения
+    const pi = runners.find((candidate) => candidate.executor === "pi");
     const runner =
-      existsSync(extension) && !command.includes("<<")
-        ? withPiExtension(command, extension)
+      existsSync(extension) &&
+      !command.includes("<<") &&
+      pi?.nameEnd !== undefined
+        ? `${command.slice(0, pi.nameEnd)} -e '${extension.replaceAll("'", String.raw`'\''`)}'${command.slice(pi.nameEnd)}`
         : command;
     const quoted = runner.replaceAll("'", String.raw`'\''`);
     // вывод уходит в файл — сторож смотрит в него: рост — жизнь, хвост — лимит
-    const outputFile = outputFileOf(
-      command,
-      typeof cwd === "string" ? cwd : undefined,
-    );
+    const outputFile = runners[0]?.outputFile;
     const watch =
       outputFile === undefined
         ? ""

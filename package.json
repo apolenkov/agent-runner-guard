@@ -2,6 +2,7 @@
   "name": "agent-runner-guard",
   "private": true,
   "type": "module",
+  "packageManager": "npm@12.2.0",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "lint": "eslint . --max-warnings 0",
@@ -27,11 +28,16 @@
     "eslint-plugin-simple-import-sort": "14.0.0",
     "eslint-plugin-unicorn": "77.0.0",
     "eslint-plugin-unused-imports": "4.4.1",
-    "knip": "6.39.0",
-    "lefthook": "2.1.17",
+    "knip": "6.40.0",
+    "lefthook": "2.2.1",
     "prettier": "3.9.9",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.1"
   },
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "dependencies": {
+    "shell-quote": "1.12.0",
+    "tree-sitter-bash": "0.25.1",
+    "web-tree-sitter": "0.27.1"
+  }
 }
